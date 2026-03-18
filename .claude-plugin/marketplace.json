@@ -1098,6 +1098,16 @@
         "sha": "cf391e95bd8ac009e3641f172434a1d130dde7fe"
       },
       "homepage": "https://docs.nimbleway.com/integrations/agent-skills/plugin-installation"
+    },
+    {
+      "name": "followrabbit",
+      "description": "Cloud cost optimization for GCP infrastructure. Review changes for cost impact and auto-apply savings recommendations using the followrabbit CLI.",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/followrabbit-ai/awesome-rabbit.git",
+        "sha": "f59ec3d1f6337a6ed825ef06836a221ed3d2ffb0"
+      },
+      "homepage": "https://subscriptions.agentic.followrabbit.ai/"
     }
   ]
 }
