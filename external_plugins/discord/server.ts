@@ -577,6 +577,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'typing',
+      description: 'Show "bot is typing…" indicator in a Discord channel. Lasts up to 10 seconds or until a message is sent. Call this as soon as you decide to respond to a message, before doing any work.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+        },
+        required: ['chat_id'],
+      },
+    },
+    {
       name: 'fetch_messages',
       description:
         "Fetch recent messages from a Discord channel. Returns oldest-first with message IDs. Discord's search API isn't exposed to bots, so this is the only way to look back.",
@@ -685,6 +696,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const msg = await ch.messages.fetch(args.message_id as string)
         const edited = await msg.edit(args.text as string)
         return { content: [{ type: 'text', text: `edited (id: ${edited.id})` }] }
+      }
+      case 'typing': {
+        const ch = await fetchAllowedChannel(args.chat_id as string)
+        if ('sendTyping' in ch) {
+          await (ch as any).sendTyping()
+        }
+        return { content: [{ type: 'text', text: 'typing indicator sent' }] }
       }
       case 'download_attachment': {
         const ch = await fetchAllowedChannel(args.chat_id as string)
@@ -800,7 +818,8 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 })
 
 client.on('messageCreate', msg => {
-  if (msg.author.bot) return
+  // Skip our own messages to avoid loops, but allow other bots through.
+  if (msg.author.id === client.user?.id) return
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
 })
 
@@ -841,10 +860,8 @@ async function handleInbound(msg: Message): Promise<void> {
     return
   }
 
-  // Typing indicator — signals "processing" until we reply (or ~10s elapses).
-  if ('sendTyping' in msg.channel) {
-    void msg.channel.sendTyping().catch(() => {})
-  }
+  // Typing indicator removed — was firing on every inbound message even when
+  // the bot decides not to respond, making it look like it's always typing.
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   const access = result.access
