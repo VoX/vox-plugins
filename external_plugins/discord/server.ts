@@ -434,6 +434,28 @@ function safeAttName(att: Attachment): string {
   return (att.name ?? att.id).replace(/[\[\]\r\n;]/g, '_')
 }
 
+// Active typing intervals per channel — cleared when a reply is sent.
+const typingIntervals = new Map<string, ReturnType<typeof setInterval>>()
+
+function startTyping(ch: any, chatId: string): void {
+  stopTyping(chatId)
+  if ('sendTyping' in ch) {
+    void (ch as any).sendTyping().catch(() => {})
+    const interval = setInterval(() => {
+      void (ch as any).sendTyping().catch(() => {})
+    }, 9000)
+    typingIntervals.set(chatId, interval)
+  }
+}
+
+function stopTyping(chatId: string): void {
+  const existing = typingIntervals.get(chatId)
+  if (existing) {
+    clearInterval(existing)
+    typingIntervals.delete(chatId)
+  }
+}
+
 const mcp = new Server(
   { name: 'discord', version: '1.0.0' },
   {
@@ -616,6 +638,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const reply_to = args.reply_to as string | undefined
         const files = (args.files as string[] | undefined) ?? []
 
+        stopTyping(chat_id)
         const ch = await fetchAllowedChannel(chat_id)
         if (!('send' in ch)) throw new Error('channel is not sendable')
 
@@ -698,11 +721,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: `edited (id: ${edited.id})` }] }
       }
       case 'typing': {
-        const ch = await fetchAllowedChannel(args.chat_id as string)
-        if ('sendTyping' in ch) {
-          await (ch as any).sendTyping()
-        }
-        return { content: [{ type: 'text', text: 'typing indicator sent' }] }
+        const chatId = args.chat_id as string
+        const ch = await fetchAllowedChannel(chatId)
+        startTyping(ch, chatId)
+        return { content: [{ type: 'text', text: 'typing indicator sent (refreshes every 9s until reply)' }] }
       }
       case 'download_attachment': {
         const ch = await fetchAllowedChannel(args.chat_id as string)
