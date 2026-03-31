@@ -904,6 +904,23 @@ async function handleInbound(msg: Message): Promise<void> {
   // forgeable by any allowlisted sender typing that string.
   const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
 
+  // Reply-to context: if this message is a reply, fetch the referenced message
+  let replyMeta: Record<string, string> = {}
+  if (msg.reference?.messageId) {
+    try {
+      const refMsg = await msg.channel.messages.fetch(msg.reference.messageId)
+      if (refMsg) {
+        replyMeta = {
+          reply_to: refMsg.id,
+          reply_to_author: refMsg.author.username,
+          reply_to_content: refMsg.content?.slice(0, 200) || '',
+        }
+      }
+    } catch {
+      // Referenced message may have been deleted — silently skip
+    }
+  }
+
   mcp.notification({
     method: 'notifications/claude/channel',
     params: {
@@ -915,6 +932,7 @@ async function handleInbound(msg: Message): Promise<void> {
         user_id: msg.author.id,
         ts: msg.createdAt.toISOString(),
         ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
+        ...replyMeta,
       },
     },
   }).catch(err => {
