@@ -600,7 +600,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'typing',
-      description: 'Show "bot is typing…" indicator in a Discord channel. Lasts up to 10 seconds or until a message is sent. Call this as soon as you decide to respond to a message, before doing any work.',
+      description: 'Show "bot is typing…" indicator in a Discord channel. Lasts until a message is sent. You MUST call this immediately when you decide a Discord message requires a response from you — before any thinking, research, or tool calls.',
       inputSchema: {
         type: 'object',
         properties: {
