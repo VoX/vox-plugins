@@ -25,6 +25,8 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ActionRowBuilder,
+  AttachmentBuilder,
+  MessageFlags,
   type Message,
   type Attachment,
   type Interaction,
@@ -629,6 +631,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'send_voice_message',
+      description: 'Send a Discord voice message (with waveform player UI) from an Ogg/Opus audio file. The file must be .ogg with Opus codec.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          file: { type: 'string', description: 'Absolute path to an .ogg (Opus) audio file.' },
+          reply_to: { type: 'string', description: 'Optional message ID to reply to.' },
+        },
+        required: ['chat_id', 'file'],
+      },
+    },
+    {
       name: 'typing',
       description: 'Show "bot is typing…" indicator in a Discord channel. Lasts until a message is sent. You MUST call this immediately when you decide a Discord message requires a response from you — before any thinking, research, or tool calls.',
       inputSchema: {
@@ -779,6 +794,53 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return {
           content: [{ type: 'text', text: `downloaded ${lines.length} attachment(s):\n${lines.join('\n')}` }],
         }
+      }
+      case 'send_voice_message': {
+        const chatId = args.chat_id as string
+        const filePath = args.file as string
+        const replyTo = args.reply_to as string | undefined
+
+        stopTyping(chatId)
+        assertSendable(filePath)
+        const st = statSync(filePath)
+        if (st.size > MAX_ATTACHMENT_BYTES) {
+          throw new Error(`file too large: ${filePath} (${(st.size / 1024 / 1024).toFixed(1)}MB, max 25MB)`)
+        }
+
+        const ch = await fetchAllowedChannel(chatId)
+        if (!('send' in ch)) throw new Error('channel is not sendable')
+
+        // Read raw audio bytes and compute a simple waveform (256 samples, RMS amplitude per chunk)
+        const audioBuf = readFileSync(filePath)
+        const chunkSize = Math.max(1, Math.floor(audioBuf.length / 256))
+        const waveformBytes = new Uint8Array(256)
+        for (let i = 0; i < 256; i++) {
+          const start = i * chunkSize
+          const end = Math.min(start + chunkSize, audioBuf.length)
+          let sum = 0
+          for (let j = start; j < end; j++) {
+            const val = (audioBuf[j] - 128) / 128
+            sum += val * val
+          }
+          waveformBytes[i] = Math.min(255, Math.floor(Math.sqrt(sum / (end - start)) * 255))
+        }
+        const waveform = Buffer.from(waveformBytes).toString('base64')
+
+        // Estimate duration from file size (Opus ~16kbps for speech ≈ 2KB/s)
+        const durationSecs = Math.max(1, Math.round(audioBuf.length / 2000))
+
+        const attachment = new AttachmentBuilder(filePath, { name: 'voice-message.ogg' })
+          .setDescription('Voice message')
+
+        const sent = await ch.send({
+          files: [{ attachment: filePath, name: 'voice-message.ogg', description: 'Voice message' }],
+          flags: MessageFlags.IsVoiceMessage,
+          ...(replyTo
+            ? { reply: { messageReference: replyTo, failIfNotExists: false } }
+            : {}),
+        })
+        noteSent(sent.id)
+        return { content: [{ type: 'text', text: `voice message sent (id: ${sent.id})` }] }
       }
       case 'pin_message': {
         const ch = await fetchAllowedChannel(args.chat_id as string)
