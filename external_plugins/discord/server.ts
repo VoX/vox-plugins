@@ -826,8 +826,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
         const waveform = Buffer.from(waveformBytes).toString('base64')
 
-        // Estimate duration from file size (Opus ~16kbps for speech ≈ 2KB/s)
-        const durationSecs = Math.max(1, Math.round(audioBuf.length / 2000))
+        // Get actual duration via ffprobe (falls back to file-size estimate)
+        let durationSecs: number
+        try {
+          const proc = Bun.spawn(['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', filePath])
+          const out = await new Response(proc.stdout).text()
+          durationSecs = Math.max(1, Math.round(parseFloat(out.trim())))
+        } catch {
+          durationSecs = Math.max(1, Math.round(audioBuf.length / 2000))
+        }
 
         // Use REST API directly — discord.js's send() doesn't support waveform/duration_secs metadata
         const { FormData, Blob } = await import('node:buffer' as any).catch(() => globalThis)
