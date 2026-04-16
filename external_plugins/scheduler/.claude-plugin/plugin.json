@@ -1,0 +1,13 @@
+{
+  "name": "scheduler",
+  "description": "Schedule messages to be delivered to your own Claude session later. One-shot or repeating. Persists across restarts.",
+  "version": "0.1.0",
+  "keywords": [
+    "scheduler",
+    "cron",
+    "timer",
+    "reminder",
+    "channel",
+    "mcp"
+  ]
+}

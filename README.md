@@ -1,35 +1,25 @@
-# Claude Code Plugins Directory
+# vox-plugins
 
-A curated directory of high-quality plugins for Claude Code.
+VoX's fork of Claude Code plugins. Small, focused, and actually maintained.
 
-> **⚠️ Important:** Make sure you trust a plugin before installing, updating, or using it. Anthropic does not control what MCP servers, files, or other software are included in plugins and cannot verify that they will work as intended or that they won't change. See each plugin's homepage for more information.
+## Plugins
 
-## Structure
-
-- **`/plugins`** - Internal plugins developed and maintained by Anthropic
-- **`/external_plugins`** - Third-party plugins from partners and the community
+- **`external_plugins/discord`** — Discord messaging channel with built-in access control. Pair, allowlist, and manage policy via `/discord:access`.
+- **`external_plugins/scheduler`** — Schedule messages to be delivered back into your own Claude session at a future time. One-shot or repeating, persists across restarts.
 
 ## Installation
 
-Plugins can be installed directly from this marketplace via Claude Code's plugin system.
+```bash
+claude plugin marketplace add vox-plugins https://github.com/bitvox/vox-plugins
+claude plugin install discord@vox-plugins
+claude plugin install scheduler@vox-plugins
+```
 
-To install, run `/plugin install {plugin-name}@claude-plugins-official`
-
-or browse for the plugin in `/plugin > Discover`
-
-## Contributing
-
-### Internal Plugins
-
-Internal plugins are developed by Anthropic team members. See `/plugins/example-plugin` for a reference implementation.
-
-### External Plugins
-
-Third-party partners can submit plugins for inclusion in the marketplace. External plugins must meet quality and security standards for approval. To submit a new plugin, use the [plugin directory submission form](https://clau.de/plugin-directory-submission).
+Or browse via `/plugin > Discover` after adding the marketplace.
 
 ## Plugin Structure
 
-Each plugin follows a standard structure:
+Each plugin follows the standard Claude Code plugin layout:
 
 ```
 plugin-name/
@@ -37,15 +27,10 @@ plugin-name/
 │   └── plugin.json      # Plugin metadata (required)
 ├── .mcp.json            # MCP server configuration (optional)
 ├── commands/            # Slash commands (optional)
-├── agents/              # Agent definitions (optional)
 ├── skills/              # Skill definitions (optional)
 └── README.md            # Documentation
 ```
 
 ## License
 
-Please see each linked plugin for the relevant LICENSE file.
-
-## Documentation
-
-For more information on developing Claude Code plugins, see the [official documentation](https://code.claude.com/docs/en/plugins).
+See each plugin's LICENSE file.

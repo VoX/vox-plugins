@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "vox-plugins",
-  "description": "Directory of popular Claude Code extensions including development tools, productivity plugins, and MCP integrations",
+  "description": "VoX's fork of Claude Code plugins. Currently: discord (messaging channel with access control) and scheduler (deliver messages to your future self).",
   "owner": {
     "name": "VoX",
     "email": "vox@bitvox.me"
@@ -12,6 +12,12 @@
       "description": "Discord messaging bridge with built-in access control. Manage pairing, allowlists, and policy via /discord:access.",
       "category": "productivity",
       "source": "./external_plugins/discord"
+    },
+    {
+      "name": "scheduler",
+      "description": "Schedule messages to be delivered back into your Claude session at a future time. One-shot or repeating, persists across restarts.",
+      "category": "productivity",
+      "source": "./external_plugins/scheduler"
     }
   ]
 }
