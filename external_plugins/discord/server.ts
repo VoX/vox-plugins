@@ -1120,7 +1120,7 @@ async function summarizeViaHaiku(text: string): Promise<string | null> {
     return null
   }
   const body = {
-    model: 'claude-haiku-4-6',
+    model: 'claude-haiku-4-5',
     max_tokens: 200,
     messages: [{
       role: 'user',
