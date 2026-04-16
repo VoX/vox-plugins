@@ -64,6 +64,14 @@ if (!TOKEN) {
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+// Per-claude-session "last channel that pinged us" file. Read by the
+// PreCompact hook so a compaction notification can target the channel
+// the user was actually talking to (avoids spamming silent channels).
+// Keyed on CLAUDE_SESSION_ID when available; falls back to 'default'
+// when the plugin runs outside a claude session (e.g. dev/manual run).
+const SESSIONS_DIR = join(STATE_DIR, 'sessions')
+const CLAUDE_SESSION_ID = process.env.CLAUDE_SESSION_ID || 'default'
+const LAST_CHAT_FILE = join(SESSIONS_DIR, CLAUDE_SESSION_ID, 'last_chat_id.txt')
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -223,6 +231,8 @@ type GateResult =
 // counts as a mention without needing fetchReference().
 const recentSentIds = new Set<string>()
 const RECENT_SENT_CAP = 200
+
+const dmChannelUsers = new Map<string, string>()
 
 function noteSent(id: string): void {
   recentSentIds.add(id)
@@ -406,7 +416,8 @@ async function fetchAllowedChannel(id: string) {
   const ch = await fetchTextChannel(id)
   const access = loadAccess()
   if (ch.type === ChannelType.DM) {
-    if (access.allowFrom.includes(ch.recipientId)) return ch
+    const userId = ch.recipientId ?? dmChannelUsers.get(id)
+    if (userId && access.allowFrom.includes(userId)) return ch
   } else {
     const key = ch.isThread() ? ch.parentId ?? ch.id : ch.id
     if (key in access.groups) return ch
@@ -1001,6 +1012,20 @@ async function handleInbound(msg: Message): Promise<void> {
   }
 
   const chat_id = msg.channelId
+
+  if (msg.channel.type === ChannelType.DM) {
+    dmChannelUsers.set(chat_id, msg.author.id)
+  }
+
+  // Record this as the most recent channel for this claude session.
+  // PreCompact hook reads it to pick a target for the "compacting" notice.
+  // Best-effort: a write failure here must not block message delivery.
+  try {
+    mkdirSync(join(SESSIONS_DIR, CLAUDE_SESSION_ID), { recursive: true, mode: 0o700 })
+    writeFileSync(LAST_CHAT_FILE, chat_id, { mode: 0o600 })
+  } catch (e) {
+    process.stderr.write(`discord: last_chat_id write failed: ${e}\n`)
+  }
 
   // Permission-reply intercept: if this looks like "yes xxxxx" for a
   // pending permission request, emit the structured event instead of
