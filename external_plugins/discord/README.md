@@ -110,3 +110,12 @@ Downloads land in `~/.claude/channels/discord/inbox/`.
 
 Same path for attachments on historical messages found via `fetch_messages`
 (messages with attachments are marked `+Natt`).
+
+## PreCompact notification
+
+The plugin ships a `PreCompact` hook that posts a one-line "compacting
+context…" notice to the last-active Discord channel before Claude Code
+auto-compacts the conversation. It's best-effort — missing state, a
+network blip, or a rate-limit never blocks the compaction. Set
+`COMPACT_NOTIFY_DISABLED=1` in the environment to mute it, or disable
+the plugin if you don't want it at all.
