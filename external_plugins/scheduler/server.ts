@@ -2,13 +2,12 @@
 /**
  * Scheduler channel for Claude Code.
  *
- * Schedules messages to be delivered back into this Claude session at a future
- * time, either once (`at`) or on a recurring systemd-calendar expression
- * (`calendar`). State lives in ~/.claude/channels/scheduler/jobs.json and
- * survives plugin restarts.
+ * Schedules messages to be delivered back into this Claude session, either
+ * once (`at`) or on a recurring systemd calendar expression (`calendar`).
+ * State persists to ~/.claude/channels/scheduler/jobs.json across restarts.
  *
- * Fires arrive via notifications/claude/channel, the same mechanism the
- * discord plugin uses — they land in the inbound context as
+ * Fires arrive via notifications/claude/channel (same mechanism the discord
+ * plugin uses), appearing as:
  *   <channel source="scheduler" scheduled_id="..." fired_at="..." ...>
  */
 
@@ -32,18 +31,18 @@ type Job = {
   id: string
   fire_at: number
   text: string
-  title?: string
-  // systemd calendar expression for recurring jobs (e.g. "Mon..Fri 09:00").
-  // Absent for one-shot jobs scheduled via `at`.
-  calendar?: string
-  // Optional cap on total fires for recurring jobs. Decrements after each
-  // successful fire; when it reaches zero the job is removed.
-  remaining_executions?: number
-  execution_count: number
   created_at: number
+  execution_count: number
+  title?: string
+  calendar?: string
+  max_executions?: number
 }
 
 type JobStore = { jobs: Job[] }
+
+const isRecurring = (j: Job): boolean => j.calendar !== undefined
+const remainingAfterFire = (j: Job): number | undefined =>
+  j.max_executions !== undefined ? j.max_executions - (j.execution_count + 1) : undefined
 
 function loadJobs(): JobStore {
   try {
@@ -64,25 +63,15 @@ function newId(): string {
   return 'sched_' + randomBytes(6).toString('hex')
 }
 
-function parseIsoAt(at: string): number {
-  const t = Date.parse(at)
-  if (isNaN(t)) throw new Error(`invalid 'at' — expected ISO-8601 timestamp, got: ${at}`)
-  return t
-}
-
-// Runs `systemd-analyze calendar <expr> --iterations=1` in UTC and returns
-// the next fire time as epoch ms. Throws with the analyzer's stderr if the
-// expression is invalid. Base time is "now" by default; pass `after` to
-// compute the next fire strictly after a given moment (used when re-arming).
+// Runs `systemd-analyze calendar <expr> --iterations=1` under TZ=UTC and
+// returns the next fire time as epoch ms. Throws with the analyzer's stderr
+// if the expression is invalid. Pass `after` to compute the next fire
+// strictly after a given moment (used when re-arming a recurring job).
 function nextCalendarFire(expr: string, after?: Date): number {
   const args = ['calendar', expr, '--iterations=1']
   if (after) {
     // systemd-analyze expects "YYYY-MM-DD HH:MM:SS UTC" for --base-time.
-    const b = after
-    const pad = (n: number) => String(n).padStart(2, '0')
-    const base =
-      `${b.getUTCFullYear()}-${pad(b.getUTCMonth() + 1)}-${pad(b.getUTCDate())} ` +
-      `${pad(b.getUTCHours())}:${pad(b.getUTCMinutes())}:${pad(b.getUTCSeconds())} UTC`
+    const base = after.toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC')
     args.push(`--base-time=${base}`)
   }
   const res = spawnSync('systemd-analyze', args, {
@@ -95,9 +84,8 @@ function nextCalendarFire(expr: string, after?: Date): number {
   }
   const m = res.stdout.match(/Next elapse:\s+\w+\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s+UTC/)
   if (!m) throw new Error(`could not parse systemd-analyze output:\n${res.stdout}`)
-  const iso = `${m[1]}T${m[2]}Z`
-  const t = Date.parse(iso)
-  if (isNaN(t)) throw new Error(`could not parse next-fire timestamp: ${iso}`)
+  const t = Date.parse(`${m[1]}T${m[2]}Z`)
+  if (isNaN(t)) throw new Error(`could not parse next-fire timestamp: ${m[1]}T${m[2]}Z`)
   return t
 }
 
@@ -114,7 +102,7 @@ function describeWhen(fireAt: number): string {
 }
 
 const mcp = new Server(
-  { name: 'scheduler', version: '0.2.0' },
+  { name: 'scheduler', version: '0.2.1' },
   {
     capabilities: {
       tools: {},
@@ -205,7 +193,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
     let fire_at: number
     if (at) {
-      fire_at = parseIsoAt(at)
+      fire_at = Date.parse(at)
+      if (isNaN(fire_at)) throw new Error(`invalid 'at' — expected ISO-8601 timestamp, got: ${at}`)
     } else {
       fire_at = nextCalendarFire(calendar!)
     }
@@ -214,11 +203,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       id: newId(),
       fire_at,
       text,
-      ...(title ? { title } : {}),
-      ...(calendar ? { calendar } : {}),
-      ...(calendar && max ? { remaining_executions: max } : {}),
       execution_count: 0,
       created_at: Date.now(),
+      ...(title ? { title } : {}),
+      ...(calendar ? { calendar } : {}),
+      ...(calendar && max ? { max_executions: max } : {}),
     }
     const store = loadJobs()
     store.jobs.push(job)
@@ -241,7 +230,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     const lines = sorted.map(j => {
       const when = `${describeWhen(j.fire_at)} (${new Date(j.fire_at).toISOString()})`
       const rec = j.calendar ? ` [${j.calendar}]` : ''
-      const rem = j.remaining_executions !== undefined ? ` remaining=${j.remaining_executions}` : ''
+      const rem = j.max_executions !== undefined
+        ? ` remaining=${j.max_executions - j.execution_count}`
+        : ''
       const count = ` fired=${j.execution_count}`
       const ttl = j.title ? ` ${j.title}` : ''
       const preview = j.text.length > 80 ? j.text.slice(0, 77) + '…' : j.text
@@ -266,57 +257,57 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   throw new Error(`unknown tool: ${name}`)
 })
 
+let ticking = false
 async function tick(): Promise<void> {
-  const store = loadJobs()
-  if (store.jobs.length === 0) return
-  const now = Date.now()
-  const due = store.jobs.filter(j => j.fire_at <= now)
-  if (due.length === 0) return
-  let changed = false
-  for (const job of due) {
-    const meta: Record<string, string> = {
-      scheduled_id: job.id,
-      fired_at: new Date(now).toISOString(),
-      originally_scheduled_for: new Date(job.fire_at).toISOString(),
-      execution_count: String(job.execution_count + 1),
-    }
-    if (job.title) meta.title = job.title
-    if (job.calendar) meta.calendar = job.calendar
-    if (job.remaining_executions !== undefined) {
-      meta.remaining_after = String(job.remaining_executions - 1)
-    }
-    try {
-      await mcp.notification({
-        method: 'notifications/claude/channel',
-        params: { content: job.text, meta },
-      })
-    } catch (err) {
-      process.stderr.write(`scheduler: failed to deliver job ${job.id}: ${err}\n`)
-      // Leave the job alone so it retries on the next tick.
-      continue
-    }
-    job.execution_count += 1
-    if (job.remaining_executions !== undefined) {
-      job.remaining_executions -= 1
-    }
-    const exhausted = job.remaining_executions !== undefined && job.remaining_executions <= 0
-    if (job.calendar && !exhausted) {
-      // Re-arm at the next scheduled instance strictly after now.
-      try {
-        job.fire_at = nextCalendarFire(job.calendar, new Date(now))
-        changed = true
-      } catch (err) {
-        process.stderr.write(`scheduler: failed to re-arm ${job.id} (${job.calendar}): ${err}\n`)
-        // Drop the job rather than loop-firing — bad state.
-        store.jobs = store.jobs.filter(j => j.id !== job.id)
-        changed = true
+  if (ticking) return
+  ticking = true
+  try {
+    const store = loadJobs()
+    if (store.jobs.length === 0) return
+    const now = Date.now()
+    const due = store.jobs.filter(j => j.fire_at <= now)
+    if (due.length === 0) return
+    let changed = false
+    for (const job of due) {
+      const remainingAfter = remainingAfterFire(job)
+      const meta: Record<string, string> = {
+        scheduled_id: job.id,
+        fired_at: new Date(now).toISOString(),
+        originally_scheduled_for: new Date(job.fire_at).toISOString(),
+        execution_count: String(job.execution_count + 1),
       }
-    } else {
-      store.jobs = store.jobs.filter(j => j.id !== job.id)
+      if (job.title) meta.title = job.title
+      if (job.calendar) meta.calendar = job.calendar
+      if (remainingAfter !== undefined) meta.remaining_after = String(remainingAfter)
+      try {
+        await mcp.notification({
+          method: 'notifications/claude/channel',
+          params: { content: job.text, meta },
+        })
+      } catch (err) {
+        // Leave the job in place so it retries next tick.
+        process.stderr.write(`scheduler: failed to deliver job ${job.id}: ${err}\n`)
+        continue
+      }
+      job.execution_count += 1
+      const exhausted = remainingAfter !== undefined && remainingAfter <= 0
+      if (isRecurring(job) && !exhausted) {
+        try {
+          job.fire_at = nextCalendarFire(job.calendar!, new Date(now))
+        } catch (err) {
+          // Drop rather than risk firing in a loop on a corrupted expression.
+          process.stderr.write(`scheduler: failed to re-arm ${job.id} (${job.calendar}): ${err}\n`)
+          store.jobs = store.jobs.filter(j => j.id !== job.id)
+        }
+      } else {
+        store.jobs = store.jobs.filter(j => j.id !== job.id)
+      }
       changed = true
     }
+    if (changed) saveJobs(store)
+  } finally {
+    ticking = false
   }
-  if (changed) saveJobs(store)
 }
 
 await mcp.connect(new StdioServerTransport())
@@ -326,6 +317,5 @@ setInterval(() => {
   tick().catch(err => process.stderr.write(`scheduler tick error: ${err}\n`))
 }, POLL_MS)
 
-// Fire once immediately after connect so any overdue jobs don't wait a full
-// poll interval on startup.
+// Fire once right after connect so overdue jobs don't wait a full poll interval.
 tick().catch(err => process.stderr.write(`scheduler startup tick error: ${err}\n`))
