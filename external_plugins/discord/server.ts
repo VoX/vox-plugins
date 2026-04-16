@@ -73,6 +73,83 @@ const SESSIONS_DIR = join(STATE_DIR, 'sessions')
 const CLAUDE_SESSION_ID = process.env.CLAUDE_SESSION_ID || 'default'
 const LAST_CHAT_FILE = join(SESSIONS_DIR, CLAUDE_SESSION_ID, 'last_chat_id.txt')
 
+// --- /dunk + /dedunk state ---
+// Per-channel "stop forwarding messages to claude" state. Persists
+// across plugin restarts so a dunk survives a service restart and the
+// user doesn't get surprise re-enablement. Single JSON file mirrors the
+// access.json pattern. Keyed by chat_id; value carries optional expiry
+// (ms-epoch) plus audit fields.
+const DUNKED_FILE = join(STATE_DIR, 'dunked.json')
+
+type DunkEntry = { until: number | null; by: string; at: number }
+type DunkedState = Record<string, DunkEntry>
+
+function loadDunkedState(): DunkedState {
+  try {
+    return JSON.parse(readFileSync(DUNKED_FILE, 'utf8')) as DunkedState
+  } catch { return {} }
+}
+
+function saveDunkedState(state: DunkedState): void {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    const tmp = DUNKED_FILE + '.tmp'
+    writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 })
+    renameSync(tmp, DUNKED_FILE)
+  } catch (e) {
+    process.stderr.write(`discord: dunked state save failed: ${e}\n`)
+  }
+}
+
+// True when a dunk entry exists for chat_id and hasn't expired. When an
+// expired entry is encountered, lazily prune it so the state file
+// doesn't accumulate stale rows. Returns the live entry (for confirm
+// UX) or null when not dunked.
+function checkDunk(state: DunkedState, chatId: string): DunkEntry | null {
+  const entry = state[chatId]
+  if (!entry) return null
+  if (entry.until !== null && entry.until <= Date.now()) {
+    delete state[chatId]
+    saveDunkedState(state)
+    return null
+  }
+  return entry
+}
+
+// "2h30m" / "45m" / "1d" / "10s" / "1h30m45s" → ms.
+// Returns null on parse failure (caller shows a friendly hint).
+function parseDuration(input: string): number | null {
+  const trimmed = input.trim().toLowerCase()
+  if (!trimmed) return null
+  const re = /(\d+)([smhd])/g
+  const units: Record<string, number> = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }
+  let total = 0
+  let consumed = 0
+  let m: RegExpExecArray | null
+  while ((m = re.exec(trimmed)) !== null) {
+    total += parseInt(m[1]!, 10) * units[m[2]!]!
+    consumed += m[0].length
+  }
+  if (total === 0 || consumed !== trimmed.length) return null
+  return total
+}
+
+// Pretty render for confirmation messages: "2h 30m", "45m", "10s".
+// Used when echoing back the parsed duration to the user.
+function formatDuration(ms: number): string {
+  const s = Math.floor(ms / 1000)
+  const d = Math.floor(s / 86400)
+  const h = Math.floor((s % 86400) / 3600)
+  const mi = Math.floor((s % 3600) / 60)
+  const se = s % 60
+  const parts: string[] = []
+  if (d) parts.push(`${d}d`)
+  if (h) parts.push(`${h}h`)
+  if (mi) parts.push(`${mi}m`)
+  if (se && !d && !h) parts.push(`${se}s`)
+  return parts.join(' ') || '0s'
+}
+
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
 process.on('unhandledRejection', err => {
@@ -1140,6 +1217,70 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     return
   }
 
+  // /dunk — silence inbound messages from this channel until /dedunk
+  // (or until the optional `for` duration elapses). Gated to allowFrom
+  // users so a stranger in a shared channel can't permamute the bot.
+  if (interaction.isChatInputCommand() && interaction.commandName === 'dunk') {
+    const access = loadAccess()
+    if (!access.allowFrom.includes(interaction.user.id)) {
+      await interaction.reply({ content: 'Not authorized.', flags: MessageFlags.Ephemeral }).catch(() => {})
+      return
+    }
+    const forStr = interaction.options.getString('for') ?? null
+    let until: number | null = null
+    if (forStr) {
+      const ms = parseDuration(forStr)
+      if (ms === null) {
+        await interaction.reply({
+          content: `Couldn't read duration \`${forStr}\` — try \`2h30m\` (units \`s\`/\`m\`/\`h\`/\`d\`).`,
+          flags: MessageFlags.Ephemeral,
+        }).catch(() => {})
+        return
+      }
+      until = Date.now() + ms
+    }
+    const state = loadDunkedState()
+    const previous = state[interaction.channelId]
+    state[interaction.channelId] = {
+      until,
+      by: `${interaction.user.username}#${interaction.user.discriminator}`,
+      at: Date.now(),
+    }
+    saveDunkedState(state)
+    const lead = previous ? '🔇 channel re-dunked' : '🔇 channel silenced'
+    const dur = until === null ? 'indefinitely' : `for ${formatDuration(until - Date.now())} (until <t:${Math.floor(until / 1000)}:t>)`
+    await interaction.reply({
+      content: `${lead} ${dur}. use \`/dedunk\` to undo.`,
+      flags: MessageFlags.Ephemeral,
+    }).catch(() => {})
+    return
+  }
+
+  // /dedunk — re-enable message forwarding for this channel. No-op
+  // confirm when the channel wasn't dunked.
+  if (interaction.isChatInputCommand() && interaction.commandName === 'dedunk') {
+    const access = loadAccess()
+    if (!access.allowFrom.includes(interaction.user.id)) {
+      await interaction.reply({ content: 'Not authorized.', flags: MessageFlags.Ephemeral }).catch(() => {})
+      return
+    }
+    const state = loadDunkedState()
+    if (!state[interaction.channelId]) {
+      await interaction.reply({
+        content: '🔊 channel wasn\'t silenced — nothing to undo.',
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {})
+      return
+    }
+    delete state[interaction.channelId]
+    saveDunkedState(state)
+    await interaction.reply({
+      content: '🔊 channel un-silenced. messages will reach the bot again.',
+      flags: MessageFlags.Ephemeral,
+    }).catch(() => {})
+    return
+  }
+
   if (!interaction.isButton()) return
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(interaction.customId)
   if (!m) return
@@ -1233,6 +1374,12 @@ async function handleInbound(msg: Message): Promise<void> {
     dmChannelUsers.set(chat_id, msg.author.id)
   }
 
+  // /dunk gate — silently drop messages from channels the user has
+  // muted. Slash commands (interactionCreate) are NOT routed through
+  // this path, so /dedunk always reaches the handler from a dunked
+  // channel. Lazy-cleans expired entries inside checkDunk.
+  if (checkDunk(loadDunkedState(), chat_id)) return
+
   // Record this as the most recent channel for this claude session.
   // PreCompact hook reads it to pick a target for the "compacting" notice.
   // Best-effort: a write failure here must not block message delivery.
@@ -1319,8 +1466,55 @@ async function handleInbound(msg: Message): Promise<void> {
   })
 }
 
+// Slash commands the bot publishes globally. Diff-then-PUT on startup
+// so we don't hammer Discord's API when the set is unchanged. Global
+// registration takes ~10 min for clients to refresh autocomplete; that
+// cost is fine for low-cadence command set changes.
+const SLASH_COMMANDS = [
+  { name: 'status',  description: 'Show what the bot is currently working on', type: 1 },
+  { name: 'dunk',    description: 'Silence this channel — bot stops forwarding messages to claude until /dedunk', type: 1,
+    options: [{ type: 3, name: 'for', description: 'Optional duration like 2h30m (units s/m/h/d). Omit for indefinite.', required: false }] },
+  { name: 'dedunk',  description: 'Re-enable message forwarding for this channel', type: 1 },
+] as const
+
+async function syncSlashCommands(appId: string): Promise<void> {
+  try {
+    const res = await fetch(`https://discord.com/api/v10/applications/${appId}/commands`, {
+      headers: { authorization: `Bot ${TOKEN}` },
+    })
+    if (!res.ok) {
+      process.stderr.write(`discord: slash command list failed: ${res.status}\n`)
+      return
+    }
+    const current = await res.json() as Array<{ name: string; description: string; type: number; options?: unknown[] }>
+    // Cheap diff — only check name/description/options shape. Discord
+    // PUT bulk-overwrites idempotently, but skipping the call when the
+    // set is already aligned saves an API hit per restart.
+    const wantNames = new Set(SLASH_COMMANDS.map(c => c.name))
+    const haveNames = new Set(current.map(c => c.name))
+    const aligned = wantNames.size === haveNames.size && [...wantNames].every(n => haveNames.has(n))
+    if (aligned) {
+      process.stderr.write(`discord: slash commands already aligned (${[...wantNames].join(', ')})\n`)
+      return
+    }
+    const put = await fetch(`https://discord.com/api/v10/applications/${appId}/commands`, {
+      method: 'PUT',
+      headers: { authorization: `Bot ${TOKEN}`, 'content-type': 'application/json' },
+      body: JSON.stringify(SLASH_COMMANDS),
+    })
+    if (!put.ok) {
+      process.stderr.write(`discord: slash command sync failed: ${put.status} ${await put.text()}\n`)
+      return
+    }
+    process.stderr.write(`discord: slash commands synced (${SLASH_COMMANDS.map(c => c.name).join(', ')})\n`)
+  } catch (e) {
+    process.stderr.write(`discord: slash command sync error: ${e}\n`)
+  }
+}
+
 client.once('ready', c => {
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
+  void syncSlashCommands(c.user.id)
 })
 
 client.login(TOKEN).catch(err => {
