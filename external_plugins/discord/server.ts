@@ -920,10 +920,226 @@ client.on('error', err => {
   process.stderr.write(`discord channel: client error: ${err}\n`)
 })
 
+// --- /status slash command ---
+// Reads the most recently active claude session transcript, summarizes
+// the tail with Haiku via the local OAuth credentials, and replies
+// ephemerally with what the bot is currently doing. Falls back to a
+// raw "last action" extract when the API call fails or credentials
+// are missing.
+
+const CLAUDE_PROJECTS_DIR = join(homedir(), '.claude', 'projects')
+const CRED_FILE = join(homedir(), '.claude', '.credentials.json')
+const STATUS_CACHE_TTL_MS = 10_000
+let statusCache: { text: string; at: number } | null = null
+
+function findNewestTranscript(): string | null {
+  // Walk ~/.claude/projects/*/*.jsonl, return path of newest mtime.
+  // Multi-claude-session safety degrades to "most recently active" —
+  // good enough until CLAUDE_SESSION_ID is wired into MCP env.
+  let newest: { path: string; mtime: number } | null = null
+  try {
+    for (const proj of readdirSync(CLAUDE_PROJECTS_DIR)) {
+      const dir = join(CLAUDE_PROJECTS_DIR, proj)
+      let stat
+      try { stat = statSync(dir) } catch { continue }
+      if (!stat.isDirectory()) continue
+      for (const f of readdirSync(dir)) {
+        if (!f.endsWith('.jsonl')) continue
+        const p = join(dir, f)
+        let s
+        try { s = statSync(p) } catch { continue }
+        if (!newest || s.mtimeMs > newest.mtime) newest = { path: p, mtime: s.mtimeMs }
+      }
+    }
+  } catch {}
+  return newest?.path ?? null
+}
+
+async function tailJsonlLines(path: string, n: number): Promise<string[]> {
+  // Stream-read the tail of a (potentially 100MB+) JSONL. Uses Bun's
+  // file API to seek-from-end so we don't load the whole transcript.
+  const f = Bun.file(path)
+  const size = f.size
+  const chunkSize = Math.min(size, 256 * 1024)
+  const slice = f.slice(Math.max(0, size - chunkSize), size)
+  const text = await slice.text()
+  const lines = text.split('\n').filter(l => l.length > 0)
+  return lines.slice(-n)
+}
+
+function summarizeTailRaw(lines: string[]): { lastAction: string; lastTs: number | null } {
+  // Heuristic extract for the no-API fallback. Returns the last
+  // assistant text or tool call as a one-liner + the latest timestamp.
+  let lastAction = '(no recent activity)'
+  let lastTs: number | null = null
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let entry
+    try { entry = JSON.parse(lines[i]) } catch { continue }
+    if (entry.timestamp) {
+      const t = Date.parse(entry.timestamp)
+      if (!Number.isNaN(t) && (lastTs === null || t > lastTs)) lastTs = t
+    }
+    if (lastAction !== '(no recent activity)') continue
+    const content = entry.message?.content
+    if (Array.isArray(content)) {
+      for (const c of content) {
+        if (c.type === 'text' && typeof c.text === 'string' && c.text.trim()) {
+          lastAction = c.text.replace(/\s+/g, ' ').slice(0, 200)
+          break
+        }
+        if (c.type === 'tool_use') {
+          const inputPreview = JSON.stringify(c.input ?? {}).slice(0, 80)
+          lastAction = `tool: ${c.name} ${inputPreview}`
+          break
+        }
+      }
+    }
+  }
+  return { lastAction, lastTs }
+}
+
+function buildSummaryPrompt(lines: string[]): string {
+  // Extract just the relevant content from each entry to keep token
+  // count low. Skip system reminders + huge tool results.
+  const parts: string[] = []
+  let totalChars = 0
+  for (const raw of lines) {
+    let entry
+    try { entry = JSON.parse(raw) } catch { continue }
+    const content = entry.message?.content
+    if (!Array.isArray(content)) continue
+    for (const c of content) {
+      let snippet = ''
+      if (c.type === 'text' && typeof c.text === 'string') {
+        if (c.text.includes('<system-reminder>')) continue
+        snippet = `assistant: ${c.text.replace(/\s+/g, ' ').slice(0, 400)}`
+      } else if (c.type === 'tool_use') {
+        snippet = `tool_use: ${c.name} ${JSON.stringify(c.input ?? {}).slice(0, 200)}`
+      } else if (c.type === 'tool_result') {
+        const txt = typeof c.content === 'string' ? c.content
+          : Array.isArray(c.content) ? c.content.map((x: { text?: string }) => x.text ?? '').join(' ')
+          : ''
+        snippet = txt.length > 300 ? `tool_result: [${txt.length} chars]` : `tool_result: ${txt.replace(/\s+/g, ' ').slice(0, 300)}`
+      }
+      if (snippet) {
+        if (totalChars + snippet.length > 3000) break
+        parts.push(snippet)
+        totalChars += snippet.length
+      }
+    }
+  }
+  return parts.join('\n')
+}
+
+async function summarizeViaHaiku(text: string): Promise<string | null> {
+  // OAuth credentials → Anthropic Messages API. Per Claude Code's
+  // documented OAuth flow: Bearer access_token + anthropic-beta header.
+  let cred
+  try { cred = JSON.parse(readFileSync(CRED_FILE, 'utf8'))?.claudeAiOauth } catch { return null }
+  const token = cred?.accessToken
+  if (!token) return null
+  if (cred.expiresAt && cred.expiresAt < Date.now()) {
+    process.stderr.write(`discord /status: oauth token expired\n`)
+    return null
+  }
+  const body = {
+    model: 'claude-haiku-4-6',
+    max_tokens: 200,
+    messages: [{
+      role: 'user',
+      content:
+        'Summarize what this assistant is doing RIGHT NOW in 1-2 short sentences. ' +
+        'Focus on the action in flight (file edits, commands, decisions). ' +
+        'Use present-continuous voice. No preamble.\n\nTRANSCRIPT TAIL:\n' + text,
+    }],
+  }
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), 8000)
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'authorization': `Bearer ${token}`,
+        'content-type': 'application/json',
+        'anthropic-beta': 'oauth-2025-04-20',
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    })
+    if (!res.ok) {
+      process.stderr.write(`discord /status: haiku ${res.status} ${await res.text()}\n`)
+      return null
+    }
+    const j = await res.json() as { content?: Array<{ type: string; text?: string }> }
+    const out = j.content?.find(c => c.type === 'text')?.text
+    return out?.trim() ?? null
+  } catch (e) {
+    process.stderr.write(`discord /status: haiku call failed: ${e}\n`)
+    return null
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function formatHumanAgo(ts: number | null): string {
+  if (ts === null) return 'never'
+  const ago = Date.now() - ts
+  if (ago < 0) return 'just now'
+  const s = Math.floor(ago / 1000)
+  if (s < 60) return `${s}s ago`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m ago`
+  const h = Math.floor(m / 60)
+  return `${h}h ${m % 60}m ago`
+}
+
+async function buildStatusReply(): Promise<string> {
+  if (statusCache && Date.now() - statusCache.at < STATUS_CACHE_TTL_MS) {
+    return statusCache.text
+  }
+  const path = findNewestTranscript()
+  if (!path) {
+    const text = 'tinyclaw is: not seeing an active claude session transcript anywhere'
+    statusCache = { text, at: Date.now() }
+    return text
+  }
+  const lines = await tailJsonlLines(path, 30).catch(() => [] as string[])
+  const { lastAction, lastTs } = summarizeTailRaw(lines)
+  // Idle gate — skip the LLM call entirely if the session hasn't
+  // moved in 5+ minutes; report idle state with the raw last action.
+  const idle = lastTs !== null && Date.now() - lastTs > 5 * 60 * 1000
+  let summary: string
+  if (idle) {
+    summary = `idle — last action ${formatHumanAgo(lastTs)}: ${lastAction}`
+  } else {
+    const prompt = buildSummaryPrompt(lines)
+    const haiku = prompt ? await summarizeViaHaiku(prompt) : null
+    summary = haiku || lastAction
+  }
+  const text =
+    `**tinyclaw is:** ${summary}\n` +
+    `last activity: ${formatHumanAgo(lastTs)}`
+  statusCache = { text, at: Date.now() }
+  return text
+}
+
 // Button-click handler for permission requests. customId is
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
 // Security mirrors the text-reply path: allowFrom must contain the sender.
 client.on('interactionCreate', async (interaction: Interaction) => {
+  // /status slash command — ephemeral status check, anyone can invoke.
+  if (interaction.isChatInputCommand() && interaction.commandName === 'status') {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {})
+    try {
+      const reply = await buildStatusReply()
+      await interaction.editReply({ content: reply.slice(0, 1900) }).catch(() => {})
+    } catch (e) {
+      await interaction.editReply({ content: `status failed: ${String(e).slice(0, 200)}` }).catch(() => {})
+    }
+    return
+  }
+
   if (!interaction.isButton()) return
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(interaction.customId)
   if (!m) return
