@@ -1096,7 +1096,7 @@ function buildSummaryPrompt(lines: string[]): string {
         const txt = typeof c.content === 'string' ? c.content
           : Array.isArray(c.content) ? c.content.map((x: { text?: string }) => x.text ?? '').join(' ')
           : ''
-        snippet = txt.length > 300 ? `tool_result: [${txt.length} chars]` : `tool_result: ${txt.replace(/\s+/g, ' ').slice(0, 300)}`
+        snippet = `tool_result: ${txt.replace(/\s+/g, ' ').slice(0, 600)}`
       }
       if (snippet) {
         if (totalChars + snippet.length > 3000) break
