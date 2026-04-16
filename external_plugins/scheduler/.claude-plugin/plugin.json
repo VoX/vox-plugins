@@ -1,7 +1,7 @@
 {
   "name": "scheduler",
-  "description": "Schedule messages to be delivered to your own Claude session later. One-shot or repeating. Persists across restarts.",
-  "version": "0.1.0",
+  "description": "Schedule messages to your own Claude session via ISO-8601 one-shots or systemd calendar expressions. Optional max-executions cap. Persists across restarts.",
+  "version": "0.2.0",
   "keywords": [
     "scheduler",
     "cron",
