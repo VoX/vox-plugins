@@ -115,6 +115,21 @@ Downloads land in `~/.claude/channels/discord/inbox/`.
 Same path for attachments on historical messages found via `fetch_messages`
 (messages with attachments are marked `+Natt`).
 
+## Opt-in gate (`VOX_PLUGINS_ENABLED`)
+
+The plugin is inert unless `VOX_PLUGINS_ENABLED=1` is set in the environment. Without it the MCP server still answers `initialize` and `tools/list` (so Claude Code's plugin registry stays happy), but exposes **zero tools**: no `.env` load, no discord.js gateway connection, no state writes, nothing. The process sits idle until shut down.
+
+**Why this exists.** Claude Code auto-starts every registered plugin MCP server in every session. Without the gate, running a fresh `claude` session on the same machine as the bot's long-lived systemd service would spin up a **second** discord.js gateway connection using the same `DISCORD_BOT_TOKEN` — producing duplicate bot responses, racing writes to `access.json` / `dm_users.json`, and generally corrupting state. `VOX_PLUGINS_ENABLED` ensures only the one session you actually want to run the bot (typically your systemd unit) touches Discord; every other session sees a silent no-op plugin.
+
+**How to opt in.** Set the env var in whatever launches your "live" session — most commonly a systemd unit:
+
+```ini
+[Service]
+Environment=VOX_PLUGINS_ENABLED=1
+```
+
+Any other `claude` session on the box stays inert automatically.
+
 ## PreCompact notification
 
 The plugin ships a `PreCompact` hook that posts a one-line "compacting
