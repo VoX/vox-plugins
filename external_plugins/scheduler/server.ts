@@ -26,6 +26,12 @@ import { spawnSync } from 'child_process'
 const STATE_DIR = process.env.SCHEDULER_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'scheduler')
 const JOBS_FILE = join(STATE_DIR, 'jobs.json')
 const POLL_MS = 5000
+// Delay before firing on_startup jobs after mcp.connect() returns. Claude
+// Code's MCP client needs to complete its initialize handshake before it
+// routes `notifications/claude/channel` back to the session as a new turn;
+// notifications sent before that are silently dropped. 3s is empirically
+// comfortable against the handshake.
+const STARTUP_JOB_DELAY_MS = 3000
 
 type Job = {
   id: string
@@ -143,7 +149,7 @@ function describeWhen(fireAt: number): string {
 }
 
 const mcp = new Server(
-  { name: 'scheduler', version: '0.2.3' },
+  { name: 'scheduler', version: '0.2.4' },
   {
     capabilities: {
       tools: {},
@@ -414,7 +420,10 @@ async function tick(): Promise<void> {
 }
 
 // Fires any on_startup jobs exactly once at server init, then removes them.
-// Must run AFTER mcp.connect() so notifications have a transport to flow on.
+// Must run AFTER mcp.connect() AND after a brief delay so Claude Code's MCP
+// client finishes its initialize handshake before we send notifications —
+// otherwise `notifications/claude/channel` is silently dropped and the job
+// is marked fulfilled without ever reaching a new turn.
 // Delivery failures leave the job in place so the next startup retries.
 async function fireStartupJobs(): Promise<void> {
   const store = loadJobs()
@@ -461,7 +470,10 @@ setInterval(() => {
   tick().catch(err => process.stderr.write(`scheduler tick error: ${err}\n`))
 }, POLL_MS)
 
-// Fire on_startup jobs first, then sweep overdue jobs so neither waits a
-// full poll interval.
-fireStartupJobs().catch(err => process.stderr.write(`scheduler startup jobs error: ${err}\n`))
+// Sweep overdue jobs right away so they don't wait a full poll interval.
+// on_startup jobs wait for STARTUP_JOB_DELAY_MS so the MCP init handshake
+// can complete before we try to notify.
 tick().catch(err => process.stderr.write(`scheduler startup tick error: ${err}\n`))
+setTimeout(() => {
+  fireStartupJobs().catch(err => process.stderr.write(`scheduler startup jobs error: ${err}\n`))
+}, STARTUP_JOB_DELAY_MS)
