@@ -1062,7 +1062,10 @@ client.on('error', err => {
 const CLAUDE_PROJECTS_DIR = join(homedir(), '.claude', 'projects')
 const CRED_FILE = join(homedir(), '.claude', '.credentials.json')
 const STATUS_CACHE_TTL_MS = 10_000
-let statusCache: { text: string; at: number } | null = null
+// Only the Haiku summary is cached (it's the only expensive field).
+// Activity, context tokens, and elapsed-since-started are recomputed
+// on every request so they stay live.
+let summaryCache: { text: string; at: number } | null = null
 
 function findNewestTranscript(): string | null {
   // Walk ~/.claude/projects/*/*.jsonl, return path of newest mtime.
@@ -1232,11 +1235,16 @@ function formatHumanAgo(ts: number | null): string {
   return `${h}h ${m % 60}m ago`
 }
 
-function extractActivityAndContext(lines: string[]): { activity: string; contextTokens: number | null } {
+function extractActivityAndContext(lines: string[]): {
+  activity: string
+  contextTokens: number | null
+  activityStartedAt: number | null
+} {
   // Walk tail entries, pair tool_use ids with tool_result ids. An unmatched
   // tool_use means that tool is still executing — its name becomes the
-  // current activity. Otherwise inspect the latest assistant content block:
-  // a thinking block means "reasoning", text means the turn is idle.
+  // current activity and its timestamp is when that activity started.
+  // Otherwise inspect the latest assistant content block: a trailing
+  // thinking block means "reasoning" (since that entry's timestamp).
   const toolUses: Array<{ name: string; id: string; ts: number }> = []
   const toolResultIds = new Set<string>()
   let latestAssistant: {
@@ -1275,13 +1283,18 @@ function extractActivityAndContext(lines: string[]): { activity: string; context
   }
 
   let activity = 'idle'
+  let activityStartedAt: number | null = null
   const unresolved = toolUses.filter(u => !toolResultIds.has(u.id))
   if (unresolved.length > 0) {
     unresolved.sort((a, b) => b.ts - a.ts)
     activity = unresolved[0].name.toLowerCase()
+    activityStartedAt = unresolved[0].ts || null
   } else if (latestAssistant) {
     const last = latestAssistant.content[latestAssistant.content.length - 1]
-    if (last?.type === 'thinking') activity = 'reasoning'
+    if (last?.type === 'thinking') {
+      activity = 'reasoning'
+      activityStartedAt = latestAssistant.ts || null
+    }
   }
 
   let contextTokens: number | null = null
@@ -1292,7 +1305,7 @@ function extractActivityAndContext(lines: string[]): { activity: string; context
       (u.cache_creation_input_tokens ?? 0) +
       (u.cache_read_input_tokens ?? 0)
   }
-  return { activity, contextTokens }
+  return { activity, contextTokens, activityStartedAt }
 }
 
 function formatTokens(n: number | null): string {
@@ -1302,35 +1315,43 @@ function formatTokens(n: number | null): string {
   return `${(n / 1_000_000).toFixed(2)}M`
 }
 
+function formatDuration(ms: number): string {
+  if (ms < 0) ms = 0
+  const s = Math.floor(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m`
+  const h = Math.floor(m / 60)
+  return `${h}h${m % 60}m`
+}
+
 async function buildStatusReply(): Promise<string> {
-  if (statusCache && Date.now() - statusCache.at < STATUS_CACHE_TTL_MS) {
-    return statusCache.text
-  }
   const path = findNewestTranscript()
-  if (!path) {
-    const text = 'not seeing an active claude session transcript anywhere'
-    statusCache = { text, at: Date.now() }
-    return text
-  }
+  if (!path) return 'not seeing an active claude session transcript anywhere'
   const lines = await tailJsonlLines(path, 30).catch(() => [] as string[])
   const { lastAction, lastTs } = summarizeTailRaw(lines)
-  const { activity, contextTokens } = extractActivityAndContext(lines)
+  const { activity, contextTokens, activityStartedAt } = extractActivityAndContext(lines)
   // Idle gate — skip the LLM call entirely if the session hasn't
   // moved in 5+ minutes; report idle state with the raw last action.
   const idle = lastTs !== null && Date.now() - lastTs > 5 * 60 * 1000
+
   let summary: string
-  if (idle) {
-    summary = `idle — last action ${formatHumanAgo(lastTs)}: ${lastAction}`
+  if (summaryCache && Date.now() - summaryCache.at < STATUS_CACHE_TTL_MS) {
+    summary = summaryCache.text
   } else {
-    const prompt = buildSummaryPrompt(lines)
-    const haiku = prompt ? await summarizeViaHaiku(prompt) : null
-    summary = haiku || lastAction
+    if (idle) {
+      summary = `idle — last action ${formatHumanAgo(lastTs)}: ${lastAction}`
+    } else {
+      const prompt = buildSummaryPrompt(lines)
+      const haiku = prompt ? await summarizeViaHaiku(prompt) : null
+      summary = haiku || lastAction
+    }
+    summaryCache = { text: summary, at: Date.now() }
   }
-  const text =
-    `${summary}\n` +
-    `now: ${activity} · ctx: ${formatTokens(contextTokens)} · updated ${formatHumanAgo(lastTs)}`
-  statusCache = { text, at: Date.now() }
-  return text
+
+  const startedAt = activityStartedAt ?? lastTs
+  const dur = startedAt !== null ? ` (${formatDuration(Date.now() - startedAt)})` : ''
+  return `${summary}\nnow: ${activity}${dur} · ctx: ${formatTokens(contextTokens)}`
 }
 
 // Button-click handler for permission requests. customId is
