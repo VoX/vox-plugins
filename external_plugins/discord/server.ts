@@ -1232,7 +1232,7 @@ async function buildStatusReply(): Promise<string> {
   }
   const path = findNewestTranscript()
   if (!path) {
-    const text = 'bot is: not seeing an active claude session transcript anywhere'
+    const text = 'not seeing an active claude session transcript anywhere'
     statusCache = { text, at: Date.now() }
     return text
   }
@@ -1250,7 +1250,7 @@ async function buildStatusReply(): Promise<string> {
     summary = haiku || lastAction
   }
   const text =
-    `**bot is:** ${summary}\n` +
+    `${summary}\n` +
     `last activity: ${formatHumanAgo(lastTs)}`
   statusCache = { text, at: Date.now() }
   return text
