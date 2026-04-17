@@ -1637,7 +1637,14 @@ async function handleInbound(msg: Message): Promise<void> {
 
   // Attachment listing goes in meta only — an in-content annotation is
   // forgeable by any allowlisted sender typing that string.
-  const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
+  const stickerLabel = msg.stickers.size > 0
+    ? `(sticker: ${[...msg.stickers.values()].map(s => s.name).join(', ')})`
+    : ''
+  const embedLabel = msg.embeds.length > 0 ? '(embed)' : ''
+  const content = msg.content
+    || stickerLabel
+    || (atts.length > 0 ? '(attachment)' : '')
+    || embedLabel
 
   // Reply-to context: if this message is a reply, fetch the referenced message
   let replyMeta: Record<string, string> = {}
