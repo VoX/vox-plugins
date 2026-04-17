@@ -36,7 +36,10 @@ type Job = {
   title?: string
   calendar?: string
   max_executions?: number
+  retry_count?: number
 }
+
+const MAX_REARM_RETRIES = 3
 
 type JobStore = { jobs: Job[] }
 
@@ -53,21 +56,59 @@ function loadJobs(): JobStore {
 }
 
 function saveJobs(store: JobStore): void {
-  mkdirSync(STATE_DIR, { recursive: true })
-  const tmp = JOBS_FILE + '.tmp'
-  writeFileSync(tmp, JSON.stringify(store, null, 2))
-  renameSync(tmp, JOBS_FILE)
+  // jobs.json contains notification text that is re-delivered to Claude —
+  // a prompt-injection vector if the file is world-readable. Lock it down
+  // to the current user only and swallow failures so a tool call never
+  // crashes the server over an I/O error.
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    const tmp = JOBS_FILE + '.tmp'
+    writeFileSync(tmp, JSON.stringify(store, null, 2), { mode: 0o600 })
+    renameSync(tmp, JOBS_FILE)
+  } catch (err) {
+    process.stderr.write(`scheduler: failed to persist jobs: ${err}\n`)
+  }
 }
 
 function newId(): string {
   return 'sched_' + randomBytes(6).toString('hex')
 }
 
+// Cached probe: is `systemd-analyze` on PATH? Runs lazily on first use so
+// macOS / minimal Alpine users get a clean error instead of a confusing
+// spawn dump. `null` means "not yet probed".
+let systemdAnalyzeAvailable: boolean | null = null
+function ensureSystemdAnalyze(): void {
+  if (systemdAnalyzeAvailable === true) return
+  if (systemdAnalyzeAvailable === false) {
+    throw new Error(
+      'calendar expressions require systemd-analyze, which is not on PATH. ' +
+      'Install systemd (Linux with systemd) or use a one-shot `at` ISO-8601 timestamp instead.',
+    )
+  }
+  const res = spawnSync('systemd-analyze', ['--version'], { encoding: 'utf8' })
+  systemdAnalyzeAvailable = res.status === 0
+  if (!systemdAnalyzeAvailable) {
+    throw new Error(
+      'calendar expressions require systemd-analyze, which is not on PATH. ' +
+      'Install systemd (Linux with systemd) or use a one-shot `at` ISO-8601 timestamp instead.',
+    )
+  }
+}
+
+// Strip systemd-analyze noise down to the first non-empty line so we don't
+// spew multi-line stack-ish output at the caller.
+function summarizeAnalyzerStderr(raw: string): string {
+  const line = raw.split('\n').map(s => s.trim()).find(s => s.length > 0)
+  return line ?? 'systemd-analyze rejected the expression'
+}
+
 // Runs `systemd-analyze calendar <expr> --iterations=1` under TZ=UTC and
-// returns the next fire time as epoch ms. Throws with the analyzer's stderr
+// returns the next fire time as epoch ms. Throws with a summarized error
 // if the expression is invalid. Pass `after` to compute the next fire
 // strictly after a given moment (used when re-arming a recurring job).
 function nextCalendarFire(expr: string, after?: Date): number {
+  ensureSystemdAnalyze()
   const args = ['calendar', expr, '--iterations=1']
   if (after) {
     // systemd-analyze expects "YYYY-MM-DD HH:MM:SS UTC" for --base-time.
@@ -79,8 +120,7 @@ function nextCalendarFire(expr: string, after?: Date): number {
     encoding: 'utf8',
   })
   if (res.status !== 0) {
-    const err = (res.stderr || res.stdout || '').trim()
-    throw new Error(`invalid calendar expression: ${err}`)
+    throw new Error(`invalid calendar expression: ${summarizeAnalyzerStderr(res.stderr || res.stdout || '')}`)
   }
   const m = res.stdout.match(/Next elapse:\s+\w+\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s+UTC/)
   if (!m) throw new Error(`could not parse systemd-analyze output:\n${res.stdout}`)
@@ -102,7 +142,7 @@ function describeWhen(fireAt: number): string {
 }
 
 const mcp = new Server(
-  { name: 'scheduler', version: '0.2.1' },
+  { name: 'scheduler', version: '0.2.2' },
   {
     capabilities: {
       tools: {},
@@ -195,6 +235,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     if (at) {
       fire_at = Date.parse(at)
       if (isNaN(fire_at)) throw new Error(`invalid 'at' — expected ISO-8601 timestamp, got: ${at}`)
+      // Silently back-scheduling is almost never what the caller wanted —
+      // reject anything more than 60s in the past so clock drift and
+      // near-now "schedule immediately" still work.
+      const earliest = Date.now() - 60_000
+      if (fire_at < earliest) {
+        throw new Error(
+          `'at' is in the past (${at}); refusing to back-schedule. Provide a future ISO-8601 timestamp.`,
+        )
+      }
     } else {
       fire_at = nextCalendarFire(calendar!)
     }
@@ -262,42 +311,73 @@ async function tick(): Promise<void> {
   if (ticking) return
   ticking = true
   try {
+    // TODO: loadJobs() reads from disk every tick, which races with
+    // concurrent writes from tool calls and external editors — a mutation
+    // made between this read and the saveJobs() below can be clobbered.
+    // Proper fix needs file locking (flock or a .lock sentinel); deferred
+    // for now since tool calls and tick both run in-process and the
+    // mutex on `ticking` already serializes our own writes.
     const store = loadJobs()
     if (store.jobs.length === 0) return
     const now = Date.now()
     const due = store.jobs.filter(j => j.fire_at <= now)
     if (due.length === 0) return
-    let changed = false
-    for (const job of due) {
-      const remainingAfter = remainingAfterFire(job)
-      const meta: Record<string, string> = {
-        scheduled_id: job.id,
-        fired_at: new Date(now).toISOString(),
-        originally_scheduled_for: new Date(job.fire_at).toISOString(),
-        execution_count: String(job.execution_count + 1),
-      }
-      if (job.title) meta.title = job.title
-      if (job.calendar) meta.calendar = job.calendar
-      if (remainingAfter !== undefined) meta.remaining_after = String(remainingAfter)
-      try {
-        await mcp.notification({
+
+    // Fire notifications in parallel — a stuck notification should not
+    // block other due jobs for this tick.
+    const results = await Promise.allSettled(
+      due.map(job => {
+        const remainingAfter = remainingAfterFire(job)
+        const meta: Record<string, string> = {
+          scheduled_id: job.id,
+          fired_at: new Date(now).toISOString(),
+          originally_scheduled_for: new Date(job.fire_at).toISOString(),
+          execution_count: String(job.execution_count + 1),
+        }
+        if (job.title) meta.title = job.title
+        if (job.calendar) meta.calendar = job.calendar
+        if (remainingAfter !== undefined) meta.remaining_after = String(remainingAfter)
+        return mcp.notification({
           method: 'notifications/claude/channel',
           params: { content: job.text, meta },
         })
-      } catch (err) {
-        // Leave the job in place so it retries next tick.
-        process.stderr.write(`scheduler: failed to deliver job ${job.id}: ${err}\n`)
+      }),
+    )
+
+    let changed = false
+    for (let i = 0; i < due.length; i++) {
+      const job = due[i]
+      const result = results[i]
+      if (result.status === 'rejected') {
+        // Leave the job in place so it retries next tick. Delivery failures
+        // do not count against the re-arm retry budget.
+        process.stderr.write(`scheduler: failed to deliver job ${job.id}: ${result.reason}\n`)
         continue
       }
+      const remainingAfter = remainingAfterFire(job)
       job.execution_count += 1
       const exhausted = remainingAfter !== undefined && remainingAfter <= 0
       if (isRecurring(job) && !exhausted) {
         try {
           job.fire_at = nextCalendarFire(job.calendar!, new Date(now))
+          job.retry_count = 0
         } catch (err) {
-          // Drop rather than risk firing in a loop on a corrupted expression.
-          process.stderr.write(`scheduler: failed to re-arm ${job.id} (${job.calendar}): ${err}\n`)
-          store.jobs = store.jobs.filter(j => j.id !== job.id)
+          // Transient analyzer failure? Keep the job at its current fire_at,
+          // bump retry_count, and try again next tick. Only drop after
+          // MAX_REARM_RETRIES consecutive failures to avoid silent data loss
+          // on a temporary systemd-analyze hiccup.
+          const retries = (job.retry_count ?? 0) + 1
+          job.retry_count = retries
+          if (retries >= MAX_REARM_RETRIES) {
+            process.stderr.write(
+              `scheduler: dropping ${job.id} (${job.calendar}) after ${retries} re-arm failures: ${err}\n`,
+            )
+            store.jobs = store.jobs.filter(j => j.id !== job.id)
+          } else {
+            process.stderr.write(
+              `scheduler: re-arm failure ${retries}/${MAX_REARM_RETRIES} for ${job.id} (${job.calendar}): ${err} — leaving in place\n`,
+            )
+          }
         }
       } else {
         store.jobs = store.jobs.filter(j => j.id !== job.id)
