@@ -93,13 +93,17 @@ Quick reference: IDs are Discord **snowflakes** (numeric — enable Developer Mo
 | Tool | Purpose |
 | --- | --- |
 | `reply` | Send to a channel. Takes `chat_id` + `text`, optionally `reply_to` (message ID) for native threading and `files` (absolute paths) for attachments — max 10 files, 25MB each. Auto-chunks; files attach to the first chunk. Returns the sent message ID(s). |
-| `react` | Add an emoji reaction to any message by ID. Unicode emoji work directly; custom emoji need `<:name:id>` form. |
-| `edit_message` | Edit a message the bot previously sent. Useful for "working…" → result progress updates. Only works on the bot's own messages. |
+| `react` | Add an emoji reaction to a message. Takes `chat_id`, `message_id`, `emoji`. Unicode emoji work directly; custom emoji need `<:name:id>` form. |
+| `edit_message` | Edit a message the bot previously sent. Takes `chat_id`, `message_id`, `text`. Useful for interim progress updates; edits don't trigger push notifications, so send a new `reply` when a long task completes. |
+| `pin_message` | Pin a message in a channel. Takes `chat_id`, `message_id`. Requires Manage Messages permission. |
+| `send_voice_message` | Send a Discord voice message (with waveform UI) from an Ogg/Opus audio file. Takes `chat_id`, `file` (absolute path to `.ogg` Opus), optional `reply_to`. |
+| `typing` | Show "bot is typing…" in a channel until a message is sent. Takes `chat_id`. The assistant calls this when it decides an inbound message needs a response, before doing the work. |
 | `fetch_messages` | Pull recent history from a channel (oldest-first). Capped at 100 per call. Each line includes the message ID so the model can `reply_to` it; messages with attachments are marked `+Natt`. Discord's search API isn't exposed to bots, so this is the only lookback. |
-| `download_attachment` | Download all attachments from a specific message by ID to `~/.claude/channels/discord/inbox/`. Returns file paths + metadata. Use when `fetch_messages` shows a message has attachments. |
+| `download_attachment` | Download all attachments from a specific message by ID to `~/.claude/channels/discord/inbox/`. Optional `dest_dir` copies files to a target directory. Returns file paths + metadata. Use when `fetch_messages` shows a message has attachments. |
 
-Inbound messages trigger a typing indicator automatically — Discord shows
-"botname is typing…" while the assistant works on a response.
+The `typing` tool lets the assistant show a typing indicator manually —
+the bot does not auto-type on every inbound message (that made it look
+like it was always responding, even when it wasn't).
 
 ## Attachments
 

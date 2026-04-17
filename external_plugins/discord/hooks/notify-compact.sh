@@ -45,7 +45,10 @@ log "resolved chat_id=$CHAT_ID from $LAST_CHAT_FILE"
 
 ENV_FILE="$STATE_DIR/.env"
 [ -r "$ENV_FILE" ] || { log "skip: no .env at $ENV_FILE"; exit 0; }
-TOKEN="$(grep -E '^DISCORD_BOT_TOKEN=' "$ENV_FILE" | head -1 | cut -d= -f2-)"
+# Strip optional surrounding single or double quotes — otherwise a line like
+# DISCORD_BOT_TOKEN="abc..." leaks the quote chars into the Bot header.
+TOKEN="$(grep -E '^DISCORD_BOT_TOKEN=' "$ENV_FILE" | head -1 | cut -d= -f2- \
+  | sed -E 's/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/')"
 [ -n "$TOKEN" ] || { log "skip: no DISCORD_BOT_TOKEN in env"; exit 0; }
 
 log "firing curl (backgrounded)"
@@ -56,7 +59,7 @@ log "firing curl (backgrounded)"
     -H "Authorization: Bot ${TOKEN}" \
     -H "Content-Type: application/json" \
     -d '{"content":"🔄 compacting context — older turns are being summarized."}' \
-    --max-time 10 2>/dev/null || echo "curl_err")
+    --max-time 4 2>/dev/null || echo "curl_err")
   T1=$(date -u +'%Y-%m-%dT%H:%M:%S.%3NZ')
   printf '%s bg curl done http=%s started=%s ended=%s\n' "$T1" "$HTTP_CODE" "$T0" "$T1" >> "$LOG_FILE" 2>/dev/null || true
 ) </dev/null >/dev/null 2>&1 &

@@ -228,11 +228,20 @@ const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 // exfil channel for arbitrary paths — but the server's own state is the one
 // thing Claude has no reason to ever send.
 function assertSendable(f: string): void {
-  let real, stateReal: string
+  // If STATE_DIR doesn't resolve (absent, perms), there's nothing to leak —
+  // skip the guard. But if the file path itself can't be resolved, treat it
+  // as not-sendable rather than fail-open: symlink tricks or racy deletions
+  // shouldn't bypass this check.
+  let stateReal: string
+  try {
+    stateReal = realpathSync(STATE_DIR)
+  } catch { return }
+  let real: string
   try {
     real = realpathSync(f)
-    stateReal = realpathSync(STATE_DIR)
-  } catch { return } // statSync will fail properly; or STATE_DIR absent → nothing to leak
+  } catch (e) {
+    throw new Error(`refusing to send unresolved path: ${f} (${(e as Error).message})`)
+  }
   const inbox = join(stateReal, 'inbox')
   if (real.startsWith(stateReal + sep) && !real.startsWith(inbox + sep)) {
     throw new Error(`refusing to send channel state: ${f}`)
@@ -291,6 +300,18 @@ function saveAccess(a: Access): void {
   renameSync(tmp, ACCESS_FILE)
 }
 
+// Single-flight async mutex for access.json mutations. gate() runs on every
+// inbound message and can interleave read→modify→rename — concurrent DMs
+// from two new senders would otherwise race and lose a pending entry or
+// allowFrom append. Reads stay lockless; only the read-modify-write path
+// inside gate() and any other mutator needs to hold this.
+let accessMutation: Promise<unknown> = Promise.resolve()
+function withAccessLock<T>(fn: () => Promise<T> | T): Promise<T> {
+  const next = accessMutation.then(fn, fn)
+  accessMutation = next.catch(() => {})
+  return next
+}
+
 function pruneExpired(a: Access): boolean {
   const now = Date.now()
   let changed = false
@@ -325,44 +346,60 @@ function noteSent(id: string): void {
 }
 
 async function gate(msg: Message): Promise<GateResult> {
-  const access = loadAccess()
-  const pruned = pruneExpired(access)
-  if (pruned) saveAccess(access)
-
-  if (access.dmPolicy === 'disabled') return { action: 'drop' }
-
   const senderId = msg.author.id
   const isDM = msg.channel.type === ChannelType.DM
 
   if (isDM) {
-    if (access.allowFrom.includes(senderId)) return { action: 'deliver', access }
-    if (access.dmPolicy === 'allowlist') return { action: 'drop' }
+    // DM path may mutate (prune, pairing create, replies++). Serialize the
+    // whole read-modify-write inside the mutex so concurrent DMs can't
+    // clobber each other's pending entries.
+    const dmResult = await withAccessLock((): GateResult => {
+      const access = loadAccess()
+      const pruned = pruneExpired(access)
+      if (pruned) saveAccess(access)
 
-    // pairing mode — check for existing non-expired code for this sender
-    for (const [code, p] of Object.entries(access.pending)) {
-      if (p.senderId === senderId) {
-        // Reply twice max (initial + one reminder), then go silent.
-        if ((p.replies ?? 1) >= 2) return { action: 'drop' }
-        p.replies = (p.replies ?? 1) + 1
-        saveAccess(access)
-        return { action: 'pair', code, isResend: true }
+      if (access.dmPolicy === 'disabled') return { action: 'drop' }
+
+      if (access.allowFrom.includes(senderId)) return { action: 'deliver', access }
+      if (access.dmPolicy === 'allowlist') return { action: 'drop' }
+
+      // pairing mode — check for existing non-expired code for this sender
+      for (const [code, p] of Object.entries(access.pending)) {
+        if (p.senderId === senderId) {
+          // Reply twice max (initial + one reminder), then go silent.
+          if ((p.replies ?? 1) >= 2) return { action: 'drop' }
+          p.replies = (p.replies ?? 1) + 1
+          saveAccess(access)
+          return { action: 'pair', code, isResend: true }
+        }
       }
-    }
-    // Cap pending at 3. Extra attempts are silently dropped.
-    if (Object.keys(access.pending).length >= 3) return { action: 'drop' }
+      // Cap pending at 3. Extra attempts are silently dropped.
+      if (Object.keys(access.pending).length >= 3) return { action: 'drop' }
 
-    const code = randomBytes(3).toString('hex') // 6 hex chars
-    const now = Date.now()
-    access.pending[code] = {
-      senderId,
-      chatId: msg.channelId, // DM channel ID — used later to confirm approval
-      createdAt: now,
-      expiresAt: now + 60 * 60 * 1000, // 1h
-      replies: 1,
-    }
-    saveAccess(access)
-    return { action: 'pair', code, isResend: false }
+      const code = randomBytes(4).toString('hex') // 8 hex chars, 32 bits
+      const now = Date.now()
+      access.pending[code] = {
+        senderId,
+        chatId: msg.channelId, // DM channel ID — used later to confirm approval
+        createdAt: now,
+        expiresAt: now + 60 * 60 * 1000, // 1h
+        replies: 1,
+      }
+      saveAccess(access)
+      return { action: 'pair', code, isResend: false }
+    })
+    return dmResult
   }
+
+  // Guild path is read-only (pruning aside) — take the lock only long enough
+  // to prune+save if needed, then drop it for the mention/policy checks.
+  const access = await withAccessLock(() => {
+    const a = loadAccess()
+    if (pruneExpired(a)) saveAccess(a)
+    return a
+  })
+
+  if (access.dmPolicy === 'disabled') return { action: 'drop' }
 
   // We key on channel ID (not guild ID) — simpler, and lets the user
   // opt in per-channel rather than per-server. Threads inherit their
@@ -507,11 +544,20 @@ async function fetchAllowedChannel(id: string) {
 }
 
 async function downloadAttachment(att: Attachment): Promise<string> {
+  // att.size is uploader metadata — check it first to reject oversized
+  // uploads before we even fetch, but don't trust it: cap the actual
+  // buffer length too so a spoofed-size upload can't blow up the inbox.
   if (att.size > MAX_ATTACHMENT_BYTES) {
     throw new Error(`attachment too large: ${(att.size / 1024 / 1024).toFixed(1)}MB, max ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB`)
   }
   const res = await fetch(att.url)
+  if (!res.ok) {
+    throw new Error(`attachment fetch failed: ${res.status} ${res.statusText} (${att.url})`)
+  }
   const buf = Buffer.from(await res.arrayBuffer())
+  if (buf.length > MAX_ATTACHMENT_BYTES) {
+    throw new Error(`attachment body too large: ${(buf.length / 1024 / 1024).toFixed(1)}MB, max ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB`)
+  }
   const name = att.name ?? `${att.id}`
   const rawExt = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : 'bin'
   const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
@@ -632,6 +678,11 @@ mcp.setNotificationHandler(
     setTimeout(() => {
       if (!resolved) {
         resolved = true
+        // Drive state.resolve() too so button-click handlers see a
+        // consistent "already resolved" view, and drop the map entry so
+        // resolvedPermissions doesn't accumulate every expired request.
+        resolvedPermissions.get(request_id)?.resolve()
+        resolvedPermissions.delete(request_id)
         void mcp.notification({
           method: 'notifications/claude/channel/permission',
           params: { request_id, behavior: 'deny' },
@@ -1247,7 +1298,8 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     const previous = state[interaction.channelId]
     state[interaction.channelId] = {
       until,
-      by: `${interaction.user.username}#${interaction.user.discriminator}`,
+      // discriminator is always "0" post-Discord-username-migration; drop it.
+      by: interaction.user.username,
       at: Date.now(),
     }
     saveDunkedState(state)
