@@ -41,7 +41,7 @@ import { join, sep } from 'path'
 // still see the MCP server respond, but with zero tools, no .env load, no
 // discord.js gateway connection, no job consumption — nothing at all.
 if (process.env.VOX_PLUGINS_ENABLED !== '1') {
-  const idle = new Server({ name: 'discord', version: '0.1.13' }, { capabilities: { tools: {} } })
+  const idle = new Server({ name: 'discord', version: '0.1.14' }, { capabilities: { tools: {} } })
   idle.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
   await idle.connect(new StdioServerTransport())
   await new Promise<never>(() => {})
@@ -1251,11 +1251,13 @@ function extractActivityAndContext(lines: string[]): {
   contextTokens: number | null
   activityStartedAt: number | null
 } {
-  // Walk tail entries, pair tool_use ids with tool_result ids. An unmatched
-  // tool_use means that tool is still executing — its name becomes the
-  // current activity and its timestamp is when that activity started.
-  // Otherwise inspect the latest assistant content block: a trailing
-  // thinking block means "reasoning" (since that entry's timestamp).
+  // Walk tail entries, pair tool_use ids with tool_result ids. State machine:
+  //   1. unmatched tool_use  → tool is still executing → activity = tool name
+  //   2. latest assistant ends with a thinking block → activity = "reasoning"
+  //   3. last user entry (prompt or tool_result) arrived AFTER the latest
+  //      assistant entry → we're mid-turn, generating the next response →
+  //      activity = "thinking"
+  //   4. otherwise → "idle" (assistant turn ended with a text block)
   const toolUses: Array<{ name: string; id: string; ts: number }> = []
   const toolResultIds = new Set<string>()
   let latestAssistant: {
@@ -1267,6 +1269,7 @@ function extractActivityAndContext(lines: string[]): {
     }
     ts: number
   } | null = null
+  let latestUserTs = 0
 
   for (const raw of lines) {
     let entry
@@ -1285,6 +1288,7 @@ function extractActivityAndContext(lines: string[]): {
         }
       }
     } else if (role === 'user') {
+      if (ts > latestUserTs) latestUserTs = ts
       for (const c of content) {
         if (c.type === 'tool_result' && c.tool_use_id) {
           toolResultIds.add(c.tool_use_id)
@@ -1305,7 +1309,13 @@ function extractActivityAndContext(lines: string[]): {
     if (last?.type === 'thinking') {
       activity = 'reasoning'
       activityStartedAt = latestAssistant.ts || null
+    } else if (latestUserTs > latestAssistant.ts) {
+      activity = 'thinking'
+      activityStartedAt = latestUserTs
     }
+  } else if (latestUserTs > 0) {
+    activity = 'thinking'
+    activityStartedAt = latestUserTs
   }
 
   let contextTokens: number | null = null
@@ -1341,7 +1351,20 @@ async function buildStatusReply(): Promise<string> {
   if (!path) return 'not seeing an active claude session transcript anywhere'
   const lines = await tailJsonlLines(path, 30).catch(() => [] as string[])
   const { lastAction, lastTs } = summarizeTailRaw(lines)
-  const { activity, contextTokens, activityStartedAt } = extractActivityAndContext(lines)
+  let { activity, contextTokens, activityStartedAt } = extractActivityAndContext(lines)
+  // Liveness guard: "thinking" is inferred from the transcript state, not a
+  // direct signal. If the file hasn't been touched in 60s+, the session is
+  // probably actually idle (crashed/hung without flushing). Tool and reasoning
+  // states stay as-is — tools legitimately hold the transcript silent while
+  // they run, and stuck-tool elapsed time is useful to surface.
+  if (activity === 'thinking') {
+    try {
+      if (Date.now() - statSync(path).mtimeMs > 60_000) {
+        activity = 'idle'
+        activityStartedAt = null
+      }
+    } catch {}
+  }
   // Idle gate — skip the LLM call entirely if the session hasn't
   // moved in 5+ minutes; report idle state with the raw last action.
   const idle = lastTs !== null && Date.now() - lastTs > 5 * 60 * 1000
