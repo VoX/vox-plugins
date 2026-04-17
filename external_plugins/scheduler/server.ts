@@ -26,6 +26,13 @@ import { spawnSync } from 'child_process'
 const STATE_DIR = process.env.SCHEDULER_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'scheduler')
 const JOBS_FILE = join(STATE_DIR, 'jobs.json')
 const POLL_MS = 5000
+// Delay from scheduler boot until on_startup jobs become due. The MCP
+// `notifications/initialized` handshake completes early (~11s), but
+// claude-code's turn queue isn't ready to enqueue new turns until the
+// --resume transcript has finished loading. Firing before that point
+// gets the notification silently dropped. 20s is comfortable even for
+// large transcripts; if startup fires still miss, bump this up.
+const STARTUP_FIRE_DELAY_MS = 20_000
 // Dedicated debug log — stderr goes into a socket to claude-code and is
 // hard to capture. Dumping to a known file lets us trace notification
 // delivery end-to-end without needing to intercept the MCP stream.
@@ -153,7 +160,7 @@ function describeWhen(fireAt: number): string {
 }
 
 const mcp = new Server(
-  { name: 'scheduler', version: '0.2.5' },
+  { name: 'scheduler', version: '0.2.6' },
   {
     capabilities: {
       tools: {},
@@ -351,12 +358,13 @@ async function tick(): Promise<void> {
     const store = loadJobs()
     if (store.jobs.length === 0) return
     const now = Date.now()
-    // Skip on_startup jobs — they fire only via fireStartupJobs() at server
-    // init, never on the regular poll interval.
-    const due = store.jobs.filter(j => !j.on_startup && j.fire_at <= now)
+    // on_startup jobs have already been rewritten at boot to a real
+    // fire_at = boot_time + STARTUP_FIRE_DELAY_MS with the flag cleared,
+    // so a simple due check is all we need here.
+    const due = store.jobs.filter(j => j.fire_at <= now)
     if (due.length === 0) return
 
-    dbg(`tick: ${due.length} due, initialized=${clientInitialized}`)
+    dbg(`tick: ${due.length} due`)
     // Fire notifications in parallel — a stuck notification should not
     // block other due jobs for this tick.
     const results = await Promise.allSettled(
@@ -428,69 +436,30 @@ async function tick(): Promise<void> {
   }
 }
 
-// Fires any on_startup jobs exactly once after the MCP initialize handshake
-// completes, then removes them. Triggered by mcp.oninitialized — firing
-// earlier causes `notifications/claude/channel` to be silently dropped.
-// Delivery failures leave the job in place so the next startup retries.
-async function fireStartupJobs(): Promise<void> {
+// Rewrites any on_startup jobs to a regular fire_at = boot_time + DELAY
+// with the flag cleared, so the normal tick() pipeline delivers them.
+// We can't fire directly at boot because claude-code's turn queue isn't
+// accepting enqueues yet during --resume transcript load — the MCP
+// handshake finishes first but the queue is only ready ~tens of seconds
+// later. Deferring through tick() gives the queue time to come up AND
+// reuses the battle-tested regular delivery path.
+function rewriteStartupJobs(): void {
   const store = loadJobs()
   const startup = store.jobs.filter(j => j.on_startup === true)
-  dbg(`fireStartupJobs: ${startup.length} startup jobs, initialized=${clientInitialized}`)
   if (startup.length === 0) return
-
-  const now = Date.now()
-  const results = await Promise.allSettled(
-    startup.map(job => {
-      const meta: Record<string, string> = {
-        scheduled_id: job.id,
-        fired_at: new Date(now).toISOString(),
-        trigger: 'on_startup',
-        execution_count: String(job.execution_count + 1),
-      }
-      if (job.title) meta.title = job.title
-      dbg(`startup fire ${job.id}: content=${JSON.stringify(job.text).slice(0, 100)} meta=${JSON.stringify(meta)}`)
-      return mcp.notification({
-        method: 'notifications/claude/channel',
-        params: { content: job.text, meta },
-      }).then(
-        () => { dbg(`startup fire ${job.id}: resolved`) },
-        err => { dbg(`startup fire ${job.id}: REJECTED ${err}`); throw err },
-      )
-    }),
-  )
-
-  const deliveredIds = new Set<string>()
-  for (let i = 0; i < startup.length; i++) {
-    const result = results[i]
-    const job = startup[i]
-    if (result.status === 'fulfilled') {
-      deliveredIds.add(job.id)
-    } else {
-      process.stderr.write(`scheduler: failed to deliver startup job ${job.id}: ${result.reason}\n`)
-    }
+  const fireAt = Date.now() + STARTUP_FIRE_DELAY_MS
+  for (const job of startup) {
+    job.fire_at = fireAt
+    delete job.on_startup
   }
-  if (deliveredIds.size > 0) {
-    store.jobs = store.jobs.filter(j => !deliveredIds.has(j.id))
-    saveJobs(store)
-  }
+  saveJobs(store)
+  dbg(`rewriteStartupJobs: ${startup.length} startup jobs rewritten to fire at ${new Date(fireAt).toISOString()} (${STARTUP_FIRE_DELAY_MS}ms from now)`)
 }
 
-// Track whether the MCP client has completed its initialize handshake.
-// Set by the `oninitialized` callback below. Startup jobs wait for this
-// signal before firing so `notifications/claude/channel` isn't dropped.
-let clientInitialized = false
-mcp.oninitialized = () => {
-  clientInitialized = true
-  dbg('mcp.oninitialized: handshake complete, firing startup jobs')
-  fireStartupJobs().catch(err => {
-    dbg(`fireStartupJobs error: ${err}`)
-    process.stderr.write(`scheduler startup jobs error: ${err}\n`)
-  })
-}
-
-dbg(`scheduler ${mcp.constructor.name} v0.2.5 booting (pid ${process.pid})`)
+dbg(`scheduler booting v0.2.6 (pid ${process.pid})`)
+rewriteStartupJobs()
 await mcp.connect(new StdioServerTransport())
-dbg(`mcp.connect() returned; waiting for initialize handshake`)
+dbg(`mcp.connect() returned; polling every ${POLL_MS}ms`)
 process.stderr.write(`scheduler: started, polling every ${POLL_MS}ms\n`)
 
 setInterval(() => {
@@ -498,5 +467,6 @@ setInterval(() => {
 }, POLL_MS)
 
 // Sweep overdue one-shot / recurring jobs right away so they don't wait a
-// full poll interval. on_startup jobs are fired separately via oninitialized.
+// full poll interval. Startup-rewritten jobs will NOT fire here because
+// their fire_at is in the future; they land on a later tick.
 tick().catch(err => process.stderr.write(`scheduler startup tick error: ${err}\n`))
