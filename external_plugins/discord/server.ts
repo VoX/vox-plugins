@@ -67,11 +67,15 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
 // Per-claude-session "last channel that pinged us" file. Read by the
 // PreCompact hook so a compaction notification can target the channel
 // the user was actually talking to (avoids spamming silent channels).
-// Keyed on CLAUDE_SESSION_ID when available; falls back to 'default'
-// when the plugin runs outside a claude session (e.g. dev/manual run).
+// Single-session only: claude code does not currently pass its
+// session_id to MCP servers via env or the MCP protocol, so we can't
+// partition this file by session. Two concurrent claude sessions on
+// the same user will clobber each other's last-chat pointer; the
+// compact notice will land in whichever session DM'd the bot most
+// recently. When anthropic exposes a session_id, swap 'default' out
+// for it here and in hooks/notify-compact.sh.
 const SESSIONS_DIR = join(STATE_DIR, 'sessions')
-const CLAUDE_SESSION_ID = process.env.CLAUDE_SESSION_ID || 'default'
-const LAST_CHAT_FILE = join(SESSIONS_DIR, CLAUDE_SESSION_ID, 'last_chat_id.txt')
+const LAST_CHAT_FILE = join(SESSIONS_DIR, 'default', 'last_chat_id.txt')
 
 // --- /dunk + /dedunk state ---
 // Per-channel "stop forwarding messages to claude" state. Persists
@@ -1380,11 +1384,12 @@ async function handleInbound(msg: Message): Promise<void> {
   // channel. Lazy-cleans expired entries inside checkDunk.
   if (checkDunk(loadDunkedState(), chat_id)) return
 
-  // Record this as the most recent channel for this claude session.
-  // PreCompact hook reads it to pick a target for the "compacting" notice.
-  // Best-effort: a write failure here must not block message delivery.
+  // Record this as the most recent channel so the PreCompact hook has a
+  // target for the "compacting" notice. See comment on LAST_CHAT_FILE —
+  // single-session only; concurrent claude sessions will clobber each
+  // other. Best-effort: a write failure here must not block delivery.
   try {
-    mkdirSync(join(SESSIONS_DIR, CLAUDE_SESSION_ID), { recursive: true, mode: 0o700 })
+    mkdirSync(join(SESSIONS_DIR, 'default'), { recursive: true, mode: 0o700 })
     writeFileSync(LAST_CHAT_FILE, chat_id, { mode: 0o600 })
   } catch (e) {
     process.stderr.write(`discord: last_chat_id write failed: ${e}\n`)
