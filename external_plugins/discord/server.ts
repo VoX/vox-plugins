@@ -1182,7 +1182,11 @@ async function summarizeViaHaiku(text: string): Promise<string | null> {
       content:
         'Summarize what this assistant is doing RIGHT NOW in 1-2 short sentences. ' +
         'Focus on the action in flight (file edits, commands, decisions). ' +
-        'Use present-continuous voice. No preamble.\n\nTRANSCRIPT TAIL:\n' + text,
+        'Start the response with a present-continuous verb (e.g. "Editing", ' +
+        '"Running", "Investigating", "Shipping"). ' +
+        'DO NOT begin with a subject noun like "The bot", "The assistant", ' +
+        '"Claude", or "It" — just the verb phrase. No preamble, no quotes.' +
+        '\n\nTRANSCRIPT TAIL:\n' + text,
     }],
   }
   const ctrl = new AbortController()
