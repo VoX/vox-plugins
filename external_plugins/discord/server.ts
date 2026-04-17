@@ -41,7 +41,7 @@ import { join, sep } from 'path'
 // still see the MCP server respond, but with zero tools, no .env load, no
 // discord.js gateway connection, no job consumption — nothing at all.
 if (process.env.VOX_PLUGINS_ENABLED !== '1') {
-  const idle = new Server({ name: 'discord', version: '0.1.14' }, { capabilities: { tools: {} } })
+  const idle = new Server({ name: 'discord', version: '0.1.15' }, { capabilities: { tools: {} } })
   idle.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
   await idle.connect(new StdioServerTransport())
   await new Promise<never>(() => {})
@@ -51,6 +51,7 @@ const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'c
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
+const DM_USERS_FILE = join(STATE_DIR, 'dm_users.json')
 
 // Load ~/.claude/channels/discord/.env into process.env. Real env wins.
 // Plugin-spawned servers don't get an env block — this is where the token lives.
@@ -345,7 +346,22 @@ type GateResult =
 const recentSentIds = new Set<string>()
 const RECENT_SENT_CAP = 200
 
+// Persisted map of DM channel id -> peer user id. Populated on every inbound
+// DM and reloaded at boot. Lets `fetchAllowedChannel` resolve the DM peer
+// before the first inbound since restart — otherwise outbound replies to a
+// DM fail with "not allowlisted" until the user messages us first.
 const dmChannelUsers = new Map<string, string>()
+try {
+  const raw = readFileSync(DM_USERS_FILE, 'utf8')
+  const obj = JSON.parse(raw) as Record<string, string>
+  for (const [cid, uid] of Object.entries(obj)) dmChannelUsers.set(cid, uid)
+} catch {}
+function saveDmChannelUsers(): void {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    writeFileSync(DM_USERS_FILE, JSON.stringify(Object.fromEntries(dmChannelUsers), null, 2), { mode: 0o600 })
+  } catch {}
+}
 
 function noteSent(id: string): void {
   recentSentIds.add(id)
@@ -1559,7 +1575,11 @@ async function handleInbound(msg: Message): Promise<void> {
   const chat_id = msg.channelId
 
   if (msg.channel.type === ChannelType.DM) {
-    dmChannelUsers.set(chat_id, msg.author.id)
+    const prev = dmChannelUsers.get(chat_id)
+    if (prev !== msg.author.id) {
+      dmChannelUsers.set(chat_id, msg.author.id)
+      saveDmChannelUsers()
+    }
   }
 
   // /dunk gate — silently drop messages from channels the user has
