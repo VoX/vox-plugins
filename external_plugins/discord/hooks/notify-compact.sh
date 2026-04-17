@@ -6,7 +6,7 @@
 #
 # Single-session only. Claude Code does not expose session_id to MCP
 # servers, so the plugin writes the last chat_id to one shared path
-# per user: ${DISCORD_STATE_DIR:-$HOME/.claude/channels/discord}/
+# per user: ${DISCORD_STATE_DIR:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/channels/discord}/
 # sessions/default/last_chat_id.txt. Two concurrent claude sessions on
 # the same user will overwrite each other's pointer; whoever DM'd last
 # wins. Matches the server-side write in server.ts. When anthropic
@@ -16,7 +16,10 @@
 
 set -u
 
-LOG_FILE="${HOME}/.claude/hooks/compact-notify.log"
+# Respect CLAUDE_CONFIG_DIR for per-instance claude setups; fall back to
+# ~/.claude for the standard single-user layout.
+CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+LOG_FILE="${CLAUDE_HOME}/hooks/compact-notify.log"
 mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
 log() { printf '%s %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%S.%3NZ')" "$*" >> "$LOG_FILE" 2>/dev/null || true; }
 
@@ -35,7 +38,7 @@ log "parsed trigger=${TRIGGER:-<empty>}"
 
 [ "$TRIGGER" = "manual" ] && { log "skip: trigger=manual"; exit 0; }
 
-STATE_DIR="${DISCORD_STATE_DIR:-$HOME/.claude/channels/discord}"
+STATE_DIR="${DISCORD_STATE_DIR:-$CLAUDE_HOME/channels/discord}"
 LAST_CHAT_FILE="$STATE_DIR/sessions/default/last_chat_id.txt"
 
 [ -r "$LAST_CHAT_FILE" ] || { log "skip: no last_chat_id file at $LAST_CHAT_FILE"; exit 0; }

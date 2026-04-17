@@ -34,7 +34,11 @@ if (process.env.VOX_PLUGINS_ENABLED !== '1') {
   await new Promise<never>(() => {})
 }
 
-const STATE_DIR = process.env.SCHEDULER_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'scheduler')
+// Respect CLAUDE_CONFIG_DIR when set (per-instance claude setups like
+// claude-discord-service). Falls back to ~/.claude for the standard
+// single-user layout. SCHEDULER_STATE_DIR still wins if explicitly set.
+const CLAUDE_HOME = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude')
+const STATE_DIR = process.env.SCHEDULER_STATE_DIR ?? join(CLAUDE_HOME, 'channels', 'scheduler')
 const JOBS_FILE = join(STATE_DIR, 'jobs.json')
 const POLL_MS = 5000
 // Delay from scheduler boot until on_startup jobs become due. The MCP

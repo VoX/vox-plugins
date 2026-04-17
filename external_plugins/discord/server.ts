@@ -47,7 +47,11 @@ if (process.env.VOX_PLUGINS_ENABLED !== '1') {
   await new Promise<never>(() => {})
 }
 
-const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
+// Respect CLAUDE_CONFIG_DIR when set (per-instance claude setups like
+// claude-discord-service). Falls back to ~/.claude for the standard
+// single-user layout. DISCORD_STATE_DIR still wins if explicitly set.
+const CLAUDE_HOME = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude')
+const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(CLAUDE_HOME, 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -1086,8 +1090,8 @@ client.on('error', err => {
 // raw "last action" extract when the API call fails or credentials
 // are missing.
 
-const CLAUDE_PROJECTS_DIR = join(homedir(), '.claude', 'projects')
-const CRED_FILE = join(homedir(), '.claude', '.credentials.json')
+const CLAUDE_PROJECTS_DIR = join(CLAUDE_HOME, 'projects')
+const CRED_FILE = join(CLAUDE_HOME, '.credentials.json')
 const STATUS_CACHE_TTL_MS = 10_000
 // Only the Haiku summary is cached (it's the only expensive field).
 // Activity, context tokens, and elapsed-since-started are recomputed
