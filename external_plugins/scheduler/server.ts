@@ -17,7 +17,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, renameSync, appendFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 import { randomBytes } from 'crypto'
@@ -26,12 +26,16 @@ import { spawnSync } from 'child_process'
 const STATE_DIR = process.env.SCHEDULER_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'scheduler')
 const JOBS_FILE = join(STATE_DIR, 'jobs.json')
 const POLL_MS = 5000
-// Delay before firing on_startup jobs after mcp.connect() returns. Claude
-// Code's MCP client needs to complete its initialize handshake before it
-// routes `notifications/claude/channel` back to the session as a new turn;
-// notifications sent before that are silently dropped. 3s is empirically
-// comfortable against the handshake.
-const STARTUP_JOB_DELAY_MS = 3000
+// Dedicated debug log — stderr goes into a socket to claude-code and is
+// hard to capture. Dumping to a known file lets us trace notification
+// delivery end-to-end without needing to intercept the MCP stream.
+const DEBUG_LOG = join(STATE_DIR, 'debug.log')
+function dbg(msg: string): void {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    appendFileSync(DEBUG_LOG, `${new Date().toISOString()} ${msg}\n`, { mode: 0o600 })
+  } catch {}
+}
 
 type Job = {
   id: string
@@ -149,7 +153,7 @@ function describeWhen(fireAt: number): string {
 }
 
 const mcp = new Server(
-  { name: 'scheduler', version: '0.2.4' },
+  { name: 'scheduler', version: '0.2.5' },
   {
     capabilities: {
       tools: {},
@@ -352,6 +356,7 @@ async function tick(): Promise<void> {
     const due = store.jobs.filter(j => !j.on_startup && j.fire_at <= now)
     if (due.length === 0) return
 
+    dbg(`tick: ${due.length} due, initialized=${clientInitialized}`)
     // Fire notifications in parallel — a stuck notification should not
     // block other due jobs for this tick.
     const results = await Promise.allSettled(
@@ -366,10 +371,14 @@ async function tick(): Promise<void> {
         if (job.title) meta.title = job.title
         if (job.calendar) meta.calendar = job.calendar
         if (remainingAfter !== undefined) meta.remaining_after = String(remainingAfter)
+        dbg(`tick fire ${job.id}: content=${JSON.stringify(job.text).slice(0, 100)} meta=${JSON.stringify(meta)}`)
         return mcp.notification({
           method: 'notifications/claude/channel',
           params: { content: job.text, meta },
-        })
+        }).then(
+          () => { dbg(`tick fire ${job.id}: resolved`) },
+          err => { dbg(`tick fire ${job.id}: REJECTED ${err}`); throw err },
+        )
       }),
     )
 
@@ -419,15 +428,14 @@ async function tick(): Promise<void> {
   }
 }
 
-// Fires any on_startup jobs exactly once at server init, then removes them.
-// Must run AFTER mcp.connect() AND after a brief delay so Claude Code's MCP
-// client finishes its initialize handshake before we send notifications —
-// otherwise `notifications/claude/channel` is silently dropped and the job
-// is marked fulfilled without ever reaching a new turn.
+// Fires any on_startup jobs exactly once after the MCP initialize handshake
+// completes, then removes them. Triggered by mcp.oninitialized — firing
+// earlier causes `notifications/claude/channel` to be silently dropped.
 // Delivery failures leave the job in place so the next startup retries.
 async function fireStartupJobs(): Promise<void> {
   const store = loadJobs()
   const startup = store.jobs.filter(j => j.on_startup === true)
+  dbg(`fireStartupJobs: ${startup.length} startup jobs, initialized=${clientInitialized}`)
   if (startup.length === 0) return
 
   const now = Date.now()
@@ -440,10 +448,14 @@ async function fireStartupJobs(): Promise<void> {
         execution_count: String(job.execution_count + 1),
       }
       if (job.title) meta.title = job.title
+      dbg(`startup fire ${job.id}: content=${JSON.stringify(job.text).slice(0, 100)} meta=${JSON.stringify(meta)}`)
       return mcp.notification({
         method: 'notifications/claude/channel',
         params: { content: job.text, meta },
-      })
+      }).then(
+        () => { dbg(`startup fire ${job.id}: resolved`) },
+        err => { dbg(`startup fire ${job.id}: REJECTED ${err}`); throw err },
+      )
     }),
   )
 
@@ -463,17 +475,28 @@ async function fireStartupJobs(): Promise<void> {
   }
 }
 
+// Track whether the MCP client has completed its initialize handshake.
+// Set by the `oninitialized` callback below. Startup jobs wait for this
+// signal before firing so `notifications/claude/channel` isn't dropped.
+let clientInitialized = false
+mcp.oninitialized = () => {
+  clientInitialized = true
+  dbg('mcp.oninitialized: handshake complete, firing startup jobs')
+  fireStartupJobs().catch(err => {
+    dbg(`fireStartupJobs error: ${err}`)
+    process.stderr.write(`scheduler startup jobs error: ${err}\n`)
+  })
+}
+
+dbg(`scheduler ${mcp.constructor.name} v0.2.5 booting (pid ${process.pid})`)
 await mcp.connect(new StdioServerTransport())
+dbg(`mcp.connect() returned; waiting for initialize handshake`)
 process.stderr.write(`scheduler: started, polling every ${POLL_MS}ms\n`)
 
 setInterval(() => {
   tick().catch(err => process.stderr.write(`scheduler tick error: ${err}\n`))
 }, POLL_MS)
 
-// Sweep overdue jobs right away so they don't wait a full poll interval.
-// on_startup jobs wait for STARTUP_JOB_DELAY_MS so the MCP init handshake
-// can complete before we try to notify.
+// Sweep overdue one-shot / recurring jobs right away so they don't wait a
+// full poll interval. on_startup jobs are fired separately via oninitialized.
 tick().catch(err => process.stderr.write(`scheduler startup tick error: ${err}\n`))
-setTimeout(() => {
-  fireStartupJobs().catch(err => process.stderr.write(`scheduler startup jobs error: ${err}\n`))
-}, STARTUP_JOB_DELAY_MS)
