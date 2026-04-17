@@ -130,6 +130,19 @@ Environment=VOX_PLUGINS_ENABLED=1
 
 Any other `claude` session on the box stays inert automatically.
 
+## Permission prompts
+
+Tool calls that trigger `permission_request` notifications get a Discord
+DM with Allow / Deny / See more buttons, sent to everyone in the
+allowlist. If no one answers within 30 s the request is auto-denied.
+
+Set `DISCORD_AUTO_ALLOW_PERMISSIONS=1` to skip the DM entirely and
+auto-approve every request. Intended for deployments where the gating
+lives in the model's own rules (CLAUDE.md, persona instructions) rather
+than the OS prompt layer. Default off. Every auto-allow writes
+`permission_request <id> auto-allowed (DISCORD_AUTO_ALLOW_PERMISSIONS=1)
+tool=<name>` to stderr for audit.
+
 ## PreCompact notification
 
 The plugin ships a `PreCompact` hook that posts a one-line "compacting

@@ -676,6 +676,17 @@ mcp.setNotificationHandler(
   }),
   async ({ params }) => {
     const { request_id, tool_name, description, input_preview } = params
+    // Auto-allow bypass: when DISCORD_AUTO_ALLOW_PERMISSIONS=1, skip the
+    // Discord prompt entirely and approve immediately. Intent: gate dangerous
+    // actions in the LLM rules (CLAUDE.md), not at the OS-prompt layer.
+    if (process.env.DISCORD_AUTO_ALLOW_PERMISSIONS === '1') {
+      process.stderr.write(`permission_request ${request_id} auto-allowed (DISCORD_AUTO_ALLOW_PERMISSIONS=1) tool=${tool_name}\n`)
+      void mcp.notification({
+        method: 'notifications/claude/channel/permission',
+        params: { request_id, behavior: 'allow' },
+      })
+      return
+    }
     pendingPermissions.set(request_id, { tool_name, description, input_preview })
     const access = loadAccess()
     const text = `🔐 Permission: ${tool_name}`
