@@ -1232,6 +1232,76 @@ function formatHumanAgo(ts: number | null): string {
   return `${h}h ${m % 60}m ago`
 }
 
+function extractActivityAndContext(lines: string[]): { activity: string; contextTokens: number | null } {
+  // Walk tail entries, pair tool_use ids with tool_result ids. An unmatched
+  // tool_use means that tool is still executing — its name becomes the
+  // current activity. Otherwise inspect the latest assistant content block:
+  // a thinking block means "reasoning", text means the turn is idle.
+  const toolUses: Array<{ name: string; id: string; ts: number }> = []
+  const toolResultIds = new Set<string>()
+  let latestAssistant: {
+    content: Array<{ type: string; name?: string; id?: string }>
+    usage?: {
+      input_tokens?: number
+      cache_creation_input_tokens?: number
+      cache_read_input_tokens?: number
+    }
+    ts: number
+  } | null = null
+
+  for (const raw of lines) {
+    let entry
+    try { entry = JSON.parse(raw) } catch { continue }
+    const ts = entry.timestamp ? Date.parse(entry.timestamp) : 0
+    const role = entry.message?.role
+    const content = entry.message?.content
+    if (!Array.isArray(content)) continue
+    if (role === 'assistant') {
+      if (!latestAssistant || ts >= latestAssistant.ts) {
+        latestAssistant = { content, usage: entry.message?.usage, ts }
+      }
+      for (const c of content) {
+        if (c.type === 'tool_use' && c.name && c.id) {
+          toolUses.push({ name: c.name, id: c.id, ts })
+        }
+      }
+    } else if (role === 'user') {
+      for (const c of content) {
+        if (c.type === 'tool_result' && c.tool_use_id) {
+          toolResultIds.add(c.tool_use_id)
+        }
+      }
+    }
+  }
+
+  let activity = 'idle'
+  const unresolved = toolUses.filter(u => !toolResultIds.has(u.id))
+  if (unresolved.length > 0) {
+    unresolved.sort((a, b) => b.ts - a.ts)
+    activity = unresolved[0].name.toLowerCase()
+  } else if (latestAssistant) {
+    const last = latestAssistant.content[latestAssistant.content.length - 1]
+    if (last?.type === 'thinking') activity = 'reasoning'
+  }
+
+  let contextTokens: number | null = null
+  if (latestAssistant?.usage) {
+    const u = latestAssistant.usage
+    contextTokens =
+      (u.input_tokens ?? 0) +
+      (u.cache_creation_input_tokens ?? 0) +
+      (u.cache_read_input_tokens ?? 0)
+  }
+  return { activity, contextTokens }
+}
+
+function formatTokens(n: number | null): string {
+  if (n === null) return '?'
+  if (n < 1000) return `${n}`
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`
+  return `${(n / 1_000_000).toFixed(2)}M`
+}
+
 async function buildStatusReply(): Promise<string> {
   if (statusCache && Date.now() - statusCache.at < STATUS_CACHE_TTL_MS) {
     return statusCache.text
@@ -1244,6 +1314,7 @@ async function buildStatusReply(): Promise<string> {
   }
   const lines = await tailJsonlLines(path, 30).catch(() => [] as string[])
   const { lastAction, lastTs } = summarizeTailRaw(lines)
+  const { activity, contextTokens } = extractActivityAndContext(lines)
   // Idle gate — skip the LLM call entirely if the session hasn't
   // moved in 5+ minutes; report idle state with the raw last action.
   const idle = lastTs !== null && Date.now() - lastTs > 5 * 60 * 1000
@@ -1257,7 +1328,7 @@ async function buildStatusReply(): Promise<string> {
   }
   const text =
     `${summary}\n` +
-    `last activity: ${formatHumanAgo(lastTs)}`
+    `now: ${activity} · ctx: ${formatTokens(contextTokens)} · updated ${formatHumanAgo(lastTs)}`
   statusCache = { text, at: Date.now() }
   return text
 }
