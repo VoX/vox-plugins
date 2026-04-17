@@ -1180,12 +1180,14 @@ async function summarizeViaHaiku(text: string): Promise<string | null> {
     messages: [{
       role: 'user',
       content:
-        'Summarize what this assistant is doing RIGHT NOW in 1-2 short sentences. ' +
-        'Focus on the action in flight (file edits, commands, decisions). ' +
-        'Start the response with a present-continuous verb (e.g. "Editing", ' +
-        '"Running", "Investigating", "Shipping"). ' +
-        'DO NOT begin with a subject noun like "The bot", "The assistant", ' +
-        '"Claude", or "It" — just the verb phrase. No preamble, no quotes.' +
+        'Summarize what this assistant has been doing and is doing right now, ' +
+        'in 1-2 short sentences. Use PAST tense for completed actions (e.g. ' +
+        '"Edited", "Shipped", "Reinstalled"). Use "now <verb>-ing" for the ' +
+        'action currently in flight (the most recent tool call or decision).\n' +
+        'Example: "Reinstalled plugins across three users after updating the ' +
+        'marketplace, now restarting the Discord service to activate the changes."\n' +
+        'Start with a verb — NEVER with a subject noun like "The bot", ' +
+        '"The assistant", "Claude", or "It". No preamble, no quotes.' +
         '\n\nTRANSCRIPT TAIL:\n' + text,
     }],
   }
