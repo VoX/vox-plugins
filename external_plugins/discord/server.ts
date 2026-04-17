@@ -36,6 +36,17 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir } from 'os'
 import { join, sep } from 'path'
 
+// Opt-in gate. Plugin is inert unless VOX_PLUGINS_ENABLED=1 is set in the
+// environment (only our systemd service sets it). Fresh claude CLI sessions
+// still see the MCP server respond, but with zero tools, no .env load, no
+// discord.js gateway connection, no job consumption — nothing at all.
+if (process.env.VOX_PLUGINS_ENABLED !== '1') {
+  const idle = new Server({ name: 'discord', version: '0.1.13' }, { capabilities: { tools: {} } })
+  idle.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
+  await idle.connect(new StdioServerTransport())
+  await new Promise<never>(() => {})
+}
+
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')

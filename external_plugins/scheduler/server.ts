@@ -23,6 +23,17 @@ import { join } from 'path'
 import { randomBytes } from 'crypto'
 import { spawnSync } from 'child_process'
 
+// Opt-in gate. Plugin is inert unless VOX_PLUGINS_ENABLED=1 is set in the
+// environment (only our systemd service sets it). Fresh claude CLI sessions
+// still see the MCP server respond, but with zero tools and no scheduler
+// polling/IO — nothing fires, nothing persists.
+if (process.env.VOX_PLUGINS_ENABLED !== '1') {
+  const idle = new Server({ name: 'scheduler', version: '0.2.7' }, { capabilities: { tools: {} } })
+  idle.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
+  await idle.connect(new StdioServerTransport())
+  await new Promise<never>(() => {})
+}
+
 const STATE_DIR = process.env.SCHEDULER_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'scheduler')
 const JOBS_FILE = join(STATE_DIR, 'jobs.json')
 const POLL_MS = 5000
@@ -160,7 +171,7 @@ function describeWhen(fireAt: number): string {
 }
 
 const mcp = new Server(
-  { name: 'scheduler', version: '0.2.6' },
+  { name: 'scheduler', version: '0.2.7' },
   {
     capabilities: {
       tools: {},
@@ -456,7 +467,7 @@ function rewriteStartupJobs(): void {
   dbg(`rewriteStartupJobs: ${startup.length} startup jobs rewritten to fire at ${new Date(fireAt).toISOString()} (${STARTUP_FIRE_DELAY_MS}ms from now)`)
 }
 
-dbg(`scheduler booting v0.2.6 (pid ${process.pid})`)
+dbg(`scheduler booting v0.2.7 (pid ${process.pid})`)
 rewriteStartupJobs()
 await mcp.connect(new StdioServerTransport())
 dbg(`mcp.connect() returned; polling every ${POLL_MS}ms`)
