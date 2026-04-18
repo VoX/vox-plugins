@@ -180,7 +180,6 @@ function loadDunkedState(): DunkedState {
 
 function saveDunkedState(state: DunkedState): void {
   try {
-    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
     const tmp = DUNKED_FILE + '.tmp'
     writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 })
     renameSync(tmp, DUNKED_FILE)
@@ -220,6 +219,30 @@ function parseDuration(input: string): number | null {
   }
   if (total === 0 || consumed !== trimmed.length) return null
   return total
+}
+
+// Shared dunk/undunk operations used by both MCP tools and slash commands.
+function applyDunk(chatId: string, by: string, durationStr?: string | null): { ok: true; msg: string } | { ok: false; msg: string } {
+  let until: number | null = null
+  if (durationStr) {
+    const ms = parseDuration(durationStr)
+    if (ms === null) return { ok: false, msg: `bad duration "${durationStr}" — try "2h30m" (units s/m/h/d)` }
+    until = Date.now() + ms
+  }
+  const state = loadDunkedState()
+  const wasAlready = !!state[chatId]
+  state[chatId] = { until, by, at: Date.now() }
+  saveDunkedState(state)
+  const dur = until === null ? 'indefinitely' : `for ${formatElapsed(until - Date.now())}`
+  return { ok: true, msg: `channel ${chatId} ${wasAlready ? 're-' : ''}dunked ${dur}` }
+}
+
+function applyUndunk(chatId: string): string {
+  const state = loadDunkedState()
+  if (!state[chatId]) return `channel ${chatId} was not dunked`
+  delete state[chatId]
+  saveDunkedState(state)
+  return `channel ${chatId} undunked`
 }
 
 // Last-resort safety net — without these the process dies silently on any
@@ -1149,31 +1172,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: 'pinned' }] }
       }
       case 'dunk': {
-        const chat_id = args.chat_id as string
-        const durationStr = args.duration as string | undefined
-        let until: number | null = null
-        if (durationStr) {
-          const ms = parseDuration(durationStr)
-          if (ms === null) {
-            return { content: [{ type: 'text', text: `bad duration "${durationStr}" — try "2h30m" (units s/m/h/d)` }], isError: true }
-          }
-          until = Date.now() + ms
-        }
-        const state = loadDunkedState()
-        state[chat_id] = { until, by: 'mcp', at: Date.now() }
-        saveDunkedState(state)
-        const dur = until === null ? 'indefinitely' : `for ${formatElapsed(until - Date.now())}`
-        return { content: [{ type: 'text', text: `channel ${chat_id} dunked ${dur}` }] }
+        const result = applyDunk(args.chat_id as string, 'mcp', args.duration as string | undefined)
+        return { content: [{ type: 'text', text: result.msg }], ...(result.ok ? {} : { isError: true }) }
       }
       case 'undunk': {
-        const chat_id = args.chat_id as string
-        const state = loadDunkedState()
-        if (!state[chat_id]) {
-          return { content: [{ type: 'text', text: `channel ${chat_id} was not dunked` }] }
-        }
-        delete state[chat_id]
-        saveDunkedState(state)
-        return { content: [{ type: 'text', text: `channel ${chat_id} undunked` }] }
+        return { content: [{ type: 'text', text: applyUndunk(args.chat_id as string) }] }
       }
       default:
         return {
@@ -1563,31 +1566,13 @@ client.on('interactionCreate', async (interaction: Interaction) => {
       return
     }
     const forStr = interaction.options.getString('for') ?? null
-    let until: number | null = null
-    if (forStr) {
-      const ms = parseDuration(forStr)
-      if (ms === null) {
-        await interaction.reply({
-          content: `Couldn't read duration \`${forStr}\` — try \`2h30m\` (units \`s\`/\`m\`/\`h\`/\`d\`).`,
-          flags: MessageFlags.Ephemeral,
-        }).catch(() => {})
-        return
-      }
-      until = Date.now() + ms
+    const result = applyDunk(interaction.channelId, interaction.user.username, forStr)
+    if (!result.ok) {
+      await interaction.reply({ content: result.msg, flags: MessageFlags.Ephemeral }).catch(() => {})
+      return
     }
-    const state = loadDunkedState()
-    const previous = state[interaction.channelId]
-    state[interaction.channelId] = {
-      until,
-      // discriminator is always "0" post-Discord-username-migration; drop it.
-      by: interaction.user.username,
-      at: Date.now(),
-    }
-    saveDunkedState(state)
-    const lead = previous ? '🔇 channel re-dunked' : '🔇 channel silenced'
-    const dur = until === null ? 'indefinitely' : `for ${formatElapsed(until - Date.now())} (until <t:${Math.floor(until / 1000)}:t>)`
     await interaction.reply({
-      content: `${lead} ${dur}. use \`/dedunk\` to undo.`,
+      content: `🔇 ${result.msg}. use \`/dedunk\` to undo.`,
       flags: MessageFlags.Ephemeral,
     }).catch(() => {})
     return
@@ -1601,18 +1586,10 @@ client.on('interactionCreate', async (interaction: Interaction) => {
       await interaction.reply({ content: 'Not authorized.', flags: MessageFlags.Ephemeral }).catch(() => {})
       return
     }
-    const state = loadDunkedState()
-    if (!state[interaction.channelId]) {
-      await interaction.reply({
-        content: '🔊 channel wasn\'t silenced — nothing to undo.',
-        flags: MessageFlags.Ephemeral,
-      }).catch(() => {})
-      return
-    }
-    delete state[interaction.channelId]
-    saveDunkedState(state)
+    const msg = applyUndunk(interaction.channelId)
+    const wasNotDunked = msg.includes('was not dunked')
     await interaction.reply({
-      content: '🔊 channel un-silenced. messages will reach the bot again.',
+      content: wasNotDunked ? '🔊 channel wasn\'t silenced — nothing to undo.' : '🔊 channel un-silenced. messages will reach the bot again.',
       flags: MessageFlags.Ephemeral,
     }).catch(() => {})
     return
