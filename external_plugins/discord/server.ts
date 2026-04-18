@@ -1571,7 +1571,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     }
     const forStr = interaction.options.getString('for') ?? null
     const allowMentions = interaction.options.getBoolean('allow_mentions') ?? false
-    const result = applyDunk(interaction.channelId, interaction.user.username, forStr, allowMentions || undefined)
+    const result = applyDunk(interaction.channelId, interaction.user.username, forStr, allowMentions)
     if (!result.ok) {
       await interaction.reply({ content: result.msg, flags: MessageFlags.Ephemeral }).catch(() => {})
       return
