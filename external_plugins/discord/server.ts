@@ -169,7 +169,7 @@ const LAST_CHAT_FILE = join(SESSIONS_DIR, 'default', 'last_chat_id.txt')
 // (ms-epoch) plus audit fields.
 const DUNKED_FILE = join(STATE_DIR, 'dunked.json')
 
-type DunkEntry = { until: number | null; by: string; at: number }
+type DunkEntry = { until: number | null; by: string; at: number; allow_mentions?: boolean }
 type DunkedState = Record<string, DunkEntry>
 
 function loadDunkedState(): DunkedState {
@@ -222,7 +222,7 @@ function parseDuration(input: string): number | null {
 }
 
 // Shared dunk/undunk operations used by both MCP tools and slash commands.
-function applyDunk(chatId: string, by: string, durationStr?: string | null): { ok: true; msg: string } | { ok: false; msg: string } {
+function applyDunk(chatId: string, by: string, durationStr?: string | null, allowMentions?: boolean): { ok: true; msg: string } | { ok: false; msg: string } {
   let until: number | null = null
   if (durationStr) {
     const ms = parseDuration(durationStr)
@@ -231,10 +231,13 @@ function applyDunk(chatId: string, by: string, durationStr?: string | null): { o
   }
   const state = loadDunkedState()
   const wasAlready = !!state[chatId]
-  state[chatId] = { until, by, at: Date.now() }
+  const entry: DunkEntry = { until, by, at: Date.now() }
+  if (allowMentions) entry.allow_mentions = true
+  state[chatId] = entry
   saveDunkedState(state)
   const dur = until === null ? 'indefinitely' : `for ${formatElapsed(until - Date.now())}`
-  return { ok: true, msg: `channel ${chatId} ${wasAlready ? 're-' : ''}dunked ${dur}` }
+  const mentionNote = allowMentions ? ' (mentions still forwarded)' : ''
+  return { ok: true, msg: `channel ${chatId} ${wasAlready ? 're-' : ''}dunked ${dur}${mentionNote}` }
 }
 
 function applyUndunk(chatId: string): string {
@@ -951,6 +954,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           chat_id: { type: 'string' },
           duration: { type: 'string', description: 'Optional duration like "2h30m", "1d", "45m". Omit for indefinite.' },
+          allow_mentions: { type: 'boolean', description: 'When true, messages that @mention the bot are still forwarded even while dunked.' },
         },
         required: ['chat_id'],
       },
@@ -1172,7 +1176,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: 'pinned' }] }
       }
       case 'dunk': {
-        const result = applyDunk(args.chat_id as string, 'mcp', args.duration as string | undefined)
+        const result = applyDunk(args.chat_id as string, 'mcp', args.duration as string | undefined, args.allow_mentions as boolean | undefined)
         return { content: [{ type: 'text', text: result.msg }], ...(result.ok ? {} : { isError: true }) }
       }
       case 'undunk': {
@@ -1566,7 +1570,8 @@ client.on('interactionCreate', async (interaction: Interaction) => {
       return
     }
     const forStr = interaction.options.getString('for') ?? null
-    const result = applyDunk(interaction.channelId, interaction.user.username, forStr)
+    const allowMentions = interaction.options.getBoolean('allow_mentions') ?? false
+    const result = applyDunk(interaction.channelId, interaction.user.username, forStr, allowMentions || undefined)
     if (!result.ok) {
       await interaction.reply({ content: result.msg, flags: MessageFlags.Ephemeral }).catch(() => {})
       return
@@ -1698,7 +1703,12 @@ async function handleInbound(msg: Message): Promise<void> {
   // muted. Slash commands (interactionCreate) are NOT routed through
   // this path, so /dedunk always reaches the handler from a dunked
   // channel. Lazy-cleans expired entries inside checkDunk.
-  if (checkDunk(loadDunkedState(), chat_id)) return
+  // When allow_mentions is set, messages that @mention the bot pass through.
+  const dunkEntry = checkDunk(loadDunkedState(), chat_id)
+  if (dunkEntry) {
+    const mentionTag = client.user?.id ? `<@${client.user.id}>` : null
+    if (!(dunkEntry.allow_mentions && mentionTag && msg.content.includes(mentionTag))) return
+  }
 
   // Record this as the most recent channel so the PreCompact hook has a
   // target for the "compacting" notice. See comment on LAST_CHAT_FILE —
@@ -1802,7 +1812,10 @@ async function handleInbound(msg: Message): Promise<void> {
 const SLASH_COMMANDS = [
   { name: 'status',  description: 'Show what the bot is currently working on', type: 1 },
   { name: 'dunk',    description: 'Silence this channel — bot stops forwarding messages to claude until /dedunk', type: 1,
-    options: [{ type: 3, name: 'for', description: 'Optional duration like 2h30m (units s/m/h/d). Omit for indefinite.', required: false }] },
+    options: [
+      { type: 3, name: 'for', description: 'Optional duration like 2h30m (units s/m/h/d). Omit for indefinite.', required: false },
+      { type: 5, name: 'allow_mentions', description: 'Still forward messages that @mention the bot', required: false },
+    ] },
   { name: 'dedunk',  description: 'Re-enable message forwarding for this channel', type: 1 },
 ] as const
 
