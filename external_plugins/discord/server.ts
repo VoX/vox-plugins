@@ -132,7 +132,6 @@ function cacheFromMessage(msg: Message): void {
 // using cached display names. On cache miss, falls back to Discord API
 // lookup (best-effort — failures leave the mention raw).
 async function resolveMentions(text: string): Promise<string> {
-  // Extract all mention matches up front (async callbacks can't be used with String.replace).
   const mentionRe = /<@[!&]?(\d+)>/g
   const matches: Array<{ full: string; id: string; isRole: boolean }> = []
   let m: RegExpExecArray | null
@@ -141,37 +140,34 @@ async function resolveMentions(text: string): Promise<string> {
   }
   if (matches.length === 0) return text
 
-  // Dedup IDs that aren't already cached — fetch each at most once per call.
-  const toFetch = new Set<string>()
-  for (const { id, isRole } of matches) {
-    if (!usernameCache.has(id)) toFetch.add(`${isRole ? 'r' : 'u'}:${id}`)
-  }
-
-  // Resolve unknown IDs via Discord API (best-effort, parallel).
-  if (toFetch.size > 0) {
-    const fetches = [...toFetch].map(async key => {
-      const [kind, id] = key.split(':') as ['r' | 'u', string]
-      try {
-        if (kind === 'r') {
-          const guild = client.guilds.cache.first()
-          if (guild) {
-            const role = await guild.roles.fetch(id)
-            if (role) cacheUsername(id, role.name)
-          }
-        } else {
-          const user = await client.users.fetch(id)
-          if (user) cacheUsername(id, user.displayName)
-        }
-      } catch {}
-    })
-    await Promise.all(fetches)
-  }
+  // Fetch uncached IDs via Discord API (best-effort, parallel, deduped).
+  // Cap at 20 to prevent rate-limit exhaustion from crafted messages.
+  const seen = new Set<string>()
+  const toFetch = matches.filter(({ id }) => {
+    if (usernameCache.has(id) || seen.has(id)) return false
+    seen.add(id)
+    return true
+  }).slice(0, 20)
+  await Promise.all(toFetch.map(async ({ id, isRole }) => {
+    try {
+      if (isRole) {
+        const guild = client.guilds.cache.first()
+        if (guild) cacheUsername(id, (await guild.roles.fetch(id)).name)
+      } else {
+        cacheUsername(id, (await client.users.fetch(id)).displayName)
+      }
+    } catch {}
+  }))
 
   // Apply replacements using the (now-populated) cache.
+  // Use replaceAll to handle duplicate mentions of the same ID.
   let result = text
+  const replaced = new Set<string>()
   for (const { full, id } of matches) {
+    if (replaced.has(full)) continue
+    replaced.add(full)
     const name = usernameCache.get(id)
-    if (name) result = result.replace(full, `${full} (${name})`)
+    if (name) result = result.replaceAll(full, `${full} (${name})`)
   }
   return result
 }
