@@ -25,7 +25,6 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ActionRowBuilder,
-  AttachmentBuilder,
   MessageFlags,
   type Message,
   type Attachment,
@@ -165,22 +164,6 @@ function parseDuration(input: string): number | null {
   }
   if (total === 0 || consumed !== trimmed.length) return null
   return total
-}
-
-// Pretty render for confirmation messages: "2h 30m", "45m", "10s".
-// Used when echoing back the parsed duration to the user.
-function formatDuration(ms: number): string {
-  const s = Math.floor(ms / 1000)
-  const d = Math.floor(s / 86400)
-  const h = Math.floor((s % 86400) / 3600)
-  const mi = Math.floor((s % 3600) / 60)
-  const se = s % 60
-  const parts: string[] = []
-  if (d) parts.push(`${d}d`)
-  if (h) parts.push(`${h}h`)
-  if (mi) parts.push(`${mi}m`)
-  if (se && !d && !h) parts.push(`${se}s`)
-  return parts.join(' ') || '0s'
 }
 
 // Last-resort safety net — without these the process dies silently on any
@@ -393,13 +376,11 @@ function noteSent(id: string): void {
 
 async function gate(msg: Message): Promise<GateResult> {
   const senderId = msg.author.id
-  const isDM = msg.channel.type === ChannelType.DM
-
-  if (isDM) {
+  if (msg.channel.type === ChannelType.DM) {
     // DM path may mutate (prune, pairing create, replies++). Serialize the
     // whole read-modify-write inside the mutex so concurrent DMs can't
     // clobber each other's pending entries.
-    const dmResult = await withAccessLock((): GateResult => {
+    return withAccessLock((): GateResult => {
       const access = loadAccess()
       const pruned = pruneExpired(access)
       if (pruned) saveAccess(access)
@@ -434,7 +415,6 @@ async function gate(msg: Message): Promise<GateResult> {
       saveAccess(access)
       return { action: 'pair', code, isResend: false }
     })
-    return dmResult
   }
 
   // Guild path is read-only (pruning aside) — take the lock only long enough
@@ -1054,8 +1034,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
 
         // Use REST API directly — discord.js's send() doesn't support waveform/duration_secs metadata
-        const { FormData, Blob } = await import('node:buffer' as any).catch(() => globalThis)
-        const form = new (globalThis as any).FormData()
+        const form = new FormData()
         form.append('payload_json', JSON.stringify({
           flags: 1 << 13,
           attachments: [{

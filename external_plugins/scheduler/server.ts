@@ -87,7 +87,6 @@ function withJobMutex<T>(fn: () => Promise<T>): Promise<T> {
 
 type JobStore = { jobs: Job[] }
 
-const isRecurring = (j: Job): boolean => j.calendar !== undefined
 const remainingAfterFire = (j: Job): number | undefined =>
   j.max_executions !== undefined ? j.max_executions - (j.execution_count + 1) : undefined
 
@@ -107,7 +106,6 @@ function saveJobs(store: JobStore): void {
   // to the current user only and swallow failures so a tool call never
   // crashes the server over an I/O error.
   try {
-    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
     const tmp = JOBS_FILE + '.tmp'
     writeFileSync(tmp, JSON.stringify(store, null, 2), { mode: 0o600 })
     renameSync(tmp, JOBS_FILE)
@@ -125,15 +123,9 @@ function newId(): string {
 // spawn dump. `null` means "not yet probed".
 let systemdAnalyzeAvailable: boolean | null = null
 function ensureSystemdAnalyze(): void {
-  if (systemdAnalyzeAvailable === true) return
-  if (systemdAnalyzeAvailable === false) {
-    throw new Error(
-      'calendar expressions require systemd-analyze, which is not on PATH. ' +
-      'Install systemd (Linux with systemd) or use a one-shot `at` ISO-8601 timestamp instead.',
-    )
+  if (systemdAnalyzeAvailable === null) {
+    systemdAnalyzeAvailable = spawnSync('systemd-analyze', ['--version'], { encoding: 'utf8' }).status === 0
   }
-  const res = spawnSync('systemd-analyze', ['--version'], { encoding: 'utf8' })
-  systemdAnalyzeAvailable = res.status === 0
   if (!systemdAnalyzeAvailable) {
     throw new Error(
       'calendar expressions require systemd-analyze, which is not on PATH. ' +
@@ -301,7 +293,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       fire_at = nextCalendarFire(calendar)
     } else {
       // on_startup job — fire_at is a sentinel (0). The regular tick ignores
-      // these; fireStartupJobs() at server init handles delivery + cleanup.
+      // these; rewriteStartupJobs() at server init handles delivery + cleanup.
       fire_at = 0
     }
 
@@ -417,7 +409,6 @@ async function tick(): Promise<void> {
         }),
       )
 
-      let changed = false
       for (let i = 0; i < due.length; i++) {
         const job = due[i]
         const result = results[i]
@@ -432,14 +423,13 @@ async function tick(): Promise<void> {
           } else {
             process.stderr.write(`scheduler: delivery failure ${failures}/${MAX_DELIVERY_FAILURES} for job ${job.id}: ${result.reason}\n`)
           }
-          changed = true
           continue
         }
         const remainingAfter = remainingAfterFire(job)
         job.execution_count += 1
         job.delivery_failures = 0
         const exhausted = remainingAfter !== undefined && remainingAfter <= 0
-        if (isRecurring(job) && !exhausted) {
+        if (job.calendar !== undefined && !exhausted) {
           try {
             job.fire_at = nextCalendarFire(job.calendar!, new Date())
             job.retry_count = 0
@@ -464,9 +454,8 @@ async function tick(): Promise<void> {
         } else {
           store.jobs = store.jobs.filter(j => j.id !== job.id)
         }
-        changed = true
       }
-      if (changed) saveJobs(store)
+      saveJobs(store)
     })
   } finally {
     ticking = false
