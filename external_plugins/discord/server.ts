@@ -129,12 +129,51 @@ function cacheFromMessage(msg: Message): void {
 }
 
 // Replace <@ID>, <@!ID>, and <@&ID> mentions with annotated versions
-// using cached display names.
-function resolveMentions(text: string): string {
-  return text.replace(/<@[!&]?(\d+)>/g, (match, id: string) => {
+// using cached display names. On cache miss, falls back to Discord API
+// lookup (best-effort — failures leave the mention raw).
+async function resolveMentions(text: string): Promise<string> {
+  // Extract all mention matches up front (async callbacks can't be used with String.replace).
+  const mentionRe = /<@[!&]?(\d+)>/g
+  const matches: Array<{ full: string; id: string; isRole: boolean }> = []
+  let m: RegExpExecArray | null
+  while ((m = mentionRe.exec(text)) !== null) {
+    matches.push({ full: m[0], id: m[1], isRole: m[0].includes('&') })
+  }
+  if (matches.length === 0) return text
+
+  // Dedup IDs that aren't already cached — fetch each at most once per call.
+  const toFetch = new Set<string>()
+  for (const { id, isRole } of matches) {
+    if (!usernameCache.has(id)) toFetch.add(`${isRole ? 'r' : 'u'}:${id}`)
+  }
+
+  // Resolve unknown IDs via Discord API (best-effort, parallel).
+  if (toFetch.size > 0) {
+    const fetches = [...toFetch].map(async key => {
+      const [kind, id] = key.split(':') as ['r' | 'u', string]
+      try {
+        if (kind === 'r') {
+          const guild = client.guilds.cache.first()
+          if (guild) {
+            const role = await guild.roles.fetch(id)
+            if (role) cacheUsername(id, role.name)
+          }
+        } else {
+          const user = await client.users.fetch(id)
+          if (user) cacheUsername(id, user.displayName)
+        }
+      } catch {}
+    })
+    await Promise.all(fetches)
+  }
+
+  // Apply replacements using the (now-populated) cache.
+  let result = text
+  for (const { full, id } of matches) {
     const name = usernameCache.get(id)
-    return name ? `${match} (${name})` : match
-  })
+    if (name) result = result.replace(full, `${full} (${name})`)
+  }
+  return result
 }
 
 // Startup cleanup: delete inbox files older than 24 hours.
@@ -1749,7 +1788,7 @@ async function handleInbound(msg: Message): Promise<void> {
     || stickerLabel
     || (atts.length > 0 ? '(attachment)' : '')
     || embedLabel
-  const content = resolveMentions(rawContent)
+  const content = await resolveMentions(rawContent)
 
   // Reply-to context: if this message is a reply, fetch the referenced message
   let replyMeta: Record<string, string> = {}
@@ -1759,7 +1798,7 @@ async function handleInbound(msg: Message): Promise<void> {
       replyMeta = {
         reply_to: refMsg.id,
         reply_to_author: refMsg.author.username,
-        reply_to_content: resolveMentions(refMsg.content?.slice(0, 200) || ''),
+        reply_to_content: await resolveMentions(refMsg.content?.slice(0, 200) || ''),
       }
     } catch {
       // Referenced message may have been deleted — silently skip
