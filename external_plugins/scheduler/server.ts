@@ -373,10 +373,10 @@ async function tick(): Promise<void> {
     const store = loadJobs()
     if (store.jobs.length === 0) return
     const now = Date.now()
-    // on_startup jobs have already been rewritten at boot to a real
-    // fire_at = boot_time + STARTUP_FIRE_DELAY_MS with the flag cleared,
-    // so a simple due check is all we need here.
-    const due = store.jobs.filter(j => j.fire_at <= now)
+    // on_startup jobs created after boot still carry the flag and
+    // fire_at=0 sentinel — skip them so they only fire after a restart.
+    // rewriteStartupJobs() clears the flag at boot.
+    const due = store.jobs.filter(j => !j.on_startup && j.fire_at <= now)
     if (due.length === 0) return
 
     dbg(`tick: ${due.length} due`)
