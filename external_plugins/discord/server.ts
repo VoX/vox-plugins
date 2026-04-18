@@ -920,6 +920,29 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['channel'],
       },
     },
+    {
+      name: 'dunk',
+      description: 'Silence a Discord channel — stop forwarding inbound messages to Claude until undunked or the optional duration expires.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          duration: { type: 'string', description: 'Optional duration like "2h30m", "1d", "45m". Omit for indefinite.' },
+        },
+        required: ['chat_id'],
+      },
+    },
+    {
+      name: 'undunk',
+      description: 'Un-silence a dunked Discord channel so messages flow to Claude again.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+        },
+        required: ['chat_id'],
+      },
+    },
   ],
 }))
 
@@ -1124,6 +1147,33 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const msg = await ch.messages.fetch(args.message_id as string)
         await msg.pin()
         return { content: [{ type: 'text', text: 'pinned' }] }
+      }
+      case 'dunk': {
+        const chat_id = args.chat_id as string
+        const durationStr = args.duration as string | undefined
+        let until: number | null = null
+        if (durationStr) {
+          const ms = parseDuration(durationStr)
+          if (ms === null) {
+            return { content: [{ type: 'text', text: `bad duration "${durationStr}" — try "2h30m" (units s/m/h/d)` }], isError: true }
+          }
+          until = Date.now() + ms
+        }
+        const state = loadDunkedState()
+        state[chat_id] = { until, by: 'mcp', at: Date.now() }
+        saveDunkedState(state)
+        const dur = until === null ? 'indefinitely' : `for ${formatElapsed(until - Date.now())}`
+        return { content: [{ type: 'text', text: `channel ${chat_id} dunked ${dur}` }] }
+      }
+      case 'undunk': {
+        const chat_id = args.chat_id as string
+        const state = loadDunkedState()
+        if (!state[chat_id]) {
+          return { content: [{ type: 'text', text: `channel ${chat_id} was not dunked` }] }
+        }
+        delete state[chat_id]
+        saveDunkedState(state)
+        return { content: [{ type: 'text', text: `channel ${chat_id} undunked` }] }
       }
       default:
         return {
