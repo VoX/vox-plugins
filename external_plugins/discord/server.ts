@@ -32,7 +32,7 @@ import {
   type Interaction,
 } from 'discord.js'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, copyFileSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, copyFileSync, unlinkSync } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
 
@@ -80,6 +80,19 @@ if (!TOKEN) {
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+mkdirSync(INBOX_DIR, { recursive: true })
+
+// Startup cleanup: delete inbox files older than 24 hours.
+try {
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000
+  for (const name of readdirSync(INBOX_DIR)) {
+    const p = join(INBOX_DIR, name)
+    try {
+      if (statSync(p).mtimeMs < cutoff) unlinkSync(p)
+    } catch {}
+  }
+} catch {}
+
 // Per-claude-session "last channel that pinged us" file. Read by the
 // PreCompact hook so a compaction notification can target the channel
 // the user was actually talking to (avoids spamming silent channels).
@@ -364,7 +377,9 @@ function saveDmChannelUsers(): void {
   try {
     mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
     writeFileSync(DM_USERS_FILE, JSON.stringify(Object.fromEntries(dmChannelUsers), null, 2), { mode: 0o600 })
-  } catch {}
+  } catch (e) {
+    process.stderr.write(`discord: saveDmChannelUsers error: ${e}\n`)
+  }
 }
 
 function noteSent(id: string): void {
@@ -657,8 +672,21 @@ const mcp = new Server(
 )
 
 // Stores full permission details for "See more" expansion keyed by request_id.
-const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
-const resolvedPermissions = new Map<string, { readonly resolved: boolean; resolve(): void }>()
+const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; createdAt: number }>()
+const resolvedPermissions = new Map<string, { readonly resolved: boolean; resolve(): void; createdAt: number }>()
+
+// Periodic sweep: delete stale permission entries older than 2 minutes.
+// Guards against leaks when a button click arrives between creation and
+// timeout without fully resolving (e.g. "See more" without allow/deny).
+setInterval(() => {
+  const cutoff = Date.now() - 2 * 60 * 1000
+  for (const [id, entry] of pendingPermissions) {
+    if (entry.createdAt < cutoff) pendingPermissions.delete(id)
+  }
+  for (const [id, entry] of resolvedPermissions) {
+    if (entry.createdAt < cutoff) resolvedPermissions.delete(id)
+  }
+}, 5 * 60 * 1000).unref()
 
 // Receive permission_request from CC → format → send to all allowlisted DMs.
 // Groups are intentionally excluded — the security thread resolution was
@@ -687,7 +715,7 @@ mcp.setNotificationHandler(
       })
       return
     }
-    pendingPermissions.set(request_id, { tool_name, description, input_preview })
+    pendingPermissions.set(request_id, { tool_name, description, input_preview, createdAt: Date.now() })
     const access = loadAccess()
     const text = `🔐 Permission: ${tool_name}`
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -736,6 +764,7 @@ mcp.setNotificationHandler(
     resolvedPermissions.set(request_id, {
       get resolved() { return resolved },
       resolve() { resolved = true },
+      createdAt: Date.now(),
     })
   },
 )
@@ -947,6 +976,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'edit_message': {
         const ch = await fetchAllowedChannel(args.chat_id as string)
         const msg = await ch.messages.fetch(args.message_id as string)
+        if (msg.author.id !== client.user?.id) {
+          throw new Error('can only edit messages sent by this bot')
+        }
         const edited = await msg.edit(args.text as string)
         return { content: [{ type: 'text', text: `edited (id: ${edited.id})` }] }
       }
@@ -1367,7 +1399,7 @@ function formatTokens(n: number | null): string {
   return `${(n / 1_000_000).toFixed(2)}M`
 }
 
-function formatDuration(ms: number): string {
+function formatElapsed(ms: number): string {
   if (ms < 0) ms = 0
   const s = Math.floor(ms / 1000)
   if (s < 60) return `${s}s`
@@ -1415,7 +1447,7 @@ async function buildStatusReply(): Promise<string> {
   }
 
   const startedAt = activityStartedAt ?? lastTs
-  const dur = startedAt !== null ? ` (${formatDuration(Date.now() - startedAt)})` : ''
+  const dur = startedAt !== null ? ` (${formatElapsed(Date.now() - startedAt)})` : ''
   return `${summary}\nnow: ${activity}${dur} · ctx: ${formatTokens(contextTokens)}`
 }
 
@@ -1467,7 +1499,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     }
     saveDunkedState(state)
     const lead = previous ? '🔇 channel re-dunked' : '🔇 channel silenced'
-    const dur = until === null ? 'indefinitely' : `for ${formatDuration(until - Date.now())} (until <t:${Math.floor(until / 1000)}:t>)`
+    const dur = until === null ? 'indefinitely' : `for ${formatElapsed(until - Date.now())} (until <t:${Math.floor(until / 1000)}:t>)`
     await interaction.reply({
       content: `${lead} ${dur}. use \`/dedunk\` to undo.`,
       flags: MessageFlags.Ephemeral,
@@ -1501,7 +1533,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
   }
 
   if (!interaction.isButton()) return
-  const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(interaction.customId)
+  const m = /^perm:(allow|deny|more):([a-z0-9]+)$/i.exec(interaction.customId)
   if (!m) return
   const access = loadAccess()
   if (!access.allowFrom.includes(interaction.user.id)) {

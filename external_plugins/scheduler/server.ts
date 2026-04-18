@@ -28,7 +28,7 @@ import { spawnSync } from 'child_process'
 // still see the MCP server respond, but with zero tools and no scheduler
 // polling/IO — nothing fires, nothing persists.
 if (process.env.VOX_PLUGINS_ENABLED !== '1') {
-  const idle = new Server({ name: 'scheduler', version: '0.2.7' }, { capabilities: { tools: {} } })
+  const idle = new Server({ name: 'scheduler', version: '0.2.10' }, { capabilities: { tools: {} } })
   idle.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
   await idle.connect(new StdioServerTransport())
   await new Promise<never>(() => {})
@@ -52,9 +52,9 @@ const STARTUP_FIRE_DELAY_MS = 20_000
 // hard to capture. Dumping to a known file lets us trace notification
 // delivery end-to-end without needing to intercept the MCP stream.
 const DEBUG_LOG = join(STATE_DIR, 'debug.log')
+mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 function dbg(msg: string): void {
   try {
-    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
     appendFileSync(DEBUG_LOG, `${new Date().toISOString()} ${msg}\n`, { mode: 0o600 })
   } catch {}
 }
@@ -69,10 +69,21 @@ type Job = {
   calendar?: string
   max_executions?: number
   retry_count?: number
+  delivery_failures?: number
   on_startup?: boolean
 }
 
 const MAX_REARM_RETRIES = 3
+const MAX_DELIVERY_FAILURES = 10
+
+// Async mutex that serializes all mutations to jobs.json — both tick() and
+// tool call handlers (schedule, cancel) must acquire it before loadJobs/saveJobs.
+let mutexChain = Promise.resolve()
+function withJobMutex<T>(fn: () => Promise<T>): Promise<T> {
+  const p = mutexChain.then(fn, fn)
+  mutexChain = p.then(() => {}, () => {})
+  return p
+}
 
 type JobStore = { jobs: Job[] }
 
@@ -83,8 +94,10 @@ const remainingAfterFire = (j: Job): number | undefined =>
 function loadJobs(): JobStore {
   try {
     return JSON.parse(readFileSync(JOBS_FILE, 'utf8')) as JobStore
-  } catch {
-    return { jobs: [] }
+  } catch (e: any) {
+    if (e?.code === 'ENOENT') return { jobs: [] }
+    process.stderr.write(`scheduler: loadJobs error: ${e}\n`)
+    throw e
   }
 }
 
@@ -175,7 +188,7 @@ function describeWhen(fireAt: number): string {
 }
 
 const mcp = new Server(
-  { name: 'scheduler', version: '0.2.7' },
+  { name: 'scheduler', version: '0.2.10' },
   {
     capabilities: {
       tools: {},
@@ -303,9 +316,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       ...(calendar && max ? { max_executions: max } : {}),
       ...(on_startup ? { on_startup: true } : {}),
     }
-    const store = loadJobs()
-    store.jobs.push(job)
-    saveJobs(store)
+    await withJobMutex(async () => {
+      const store = loadJobs()
+      store.jobs.push(job)
+      saveJobs(store)
+    })
     const lines = on_startup
       ? [`${job.id} — fires on next scheduler startup`]
       : [`${job.id} — fires in ${describeWhen(job.fire_at)} at ${new Date(job.fire_at).toISOString()}`]
@@ -346,14 +361,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   if (name === 'cancel') {
     const id = String(args.id ?? '')
     if (!id) throw new Error('id is required')
-    const store = loadJobs()
-    const before = store.jobs.length
-    store.jobs = store.jobs.filter(j => j.id !== id)
-    if (store.jobs.length === before) {
-      return { content: [{ type: 'text', text: `no job with id ${id}` }] }
-    }
-    saveJobs(store)
-    return { content: [{ type: 'text', text: `cancelled ${id}` }] }
+    return withJobMutex(async () => {
+      const store = loadJobs()
+      const before = store.jobs.length
+      store.jobs = store.jobs.filter(j => j.id !== id)
+      if (store.jobs.length === before) {
+        return { content: [{ type: 'text', text: `no job with id ${id}` }] }
+      }
+      saveJobs(store)
+      return { content: [{ type: 'text', text: `cancelled ${id}` }] }
+    })
   }
 
   throw new Error(`unknown tool: ${name}`)
@@ -364,88 +381,93 @@ async function tick(): Promise<void> {
   if (ticking) return
   ticking = true
   try {
-    // TODO: loadJobs() reads from disk every tick, which races with
-    // concurrent writes from tool calls and external editors — a mutation
-    // made between this read and the saveJobs() below can be clobbered.
-    // Proper fix needs file locking (flock or a .lock sentinel); deferred
-    // for now since tool calls and tick both run in-process and the
-    // mutex on `ticking` already serializes our own writes.
-    const store = loadJobs()
-    if (store.jobs.length === 0) return
-    const now = Date.now()
-    // on_startup jobs created after boot still carry the flag and
-    // fire_at=0 sentinel — skip them so they only fire after a restart.
-    // rewriteStartupJobs() clears the flag at boot.
-    const due = store.jobs.filter(j => !j.on_startup && j.fire_at <= now)
-    if (due.length === 0) return
+    await withJobMutex(async () => {
+      const store = loadJobs()
+      if (store.jobs.length === 0) return
+      const now = Date.now()
+      // on_startup jobs created after boot still carry the flag and
+      // fire_at=0 sentinel — skip them so they only fire after a restart.
+      // rewriteStartupJobs() clears the flag at boot.
+      const due = store.jobs.filter(j => !j.on_startup && j.fire_at <= now)
+      if (due.length === 0) return
 
-    dbg(`tick: ${due.length} due`)
-    // Fire notifications in parallel — a stuck notification should not
-    // block other due jobs for this tick.
-    const results = await Promise.allSettled(
-      due.map(job => {
-        const remainingAfter = remainingAfterFire(job)
-        const meta: Record<string, string> = {
-          scheduled_id: job.id,
-          fired_at: new Date(now).toISOString(),
-          originally_scheduled_for: new Date(job.fire_at).toISOString(),
-          execution_count: String(job.execution_count + 1),
-        }
-        if (job.title) meta.title = job.title
-        if (job.calendar) meta.calendar = job.calendar
-        if (remainingAfter !== undefined) meta.remaining_after = String(remainingAfter)
-        dbg(`tick fire ${job.id}: content=${JSON.stringify(job.text).slice(0, 100)} meta=${JSON.stringify(meta)}`)
-        return mcp.notification({
-          method: 'notifications/claude/channel',
-          params: { content: job.text, meta },
-        }).then(
-          () => { dbg(`tick fire ${job.id}: resolved`) },
-          err => { dbg(`tick fire ${job.id}: REJECTED ${err}`); throw err },
-        )
-      }),
-    )
+      dbg(`tick: ${due.length} due`)
+      // Fire notifications in parallel — a stuck notification should not
+      // block other due jobs for this tick.
+      const results = await Promise.allSettled(
+        due.map(job => {
+          const remainingAfter = remainingAfterFire(job)
+          const meta: Record<string, string> = {
+            scheduled_id: job.id,
+            fired_at: new Date(now).toISOString(),
+            originally_scheduled_for: new Date(job.fire_at).toISOString(),
+            execution_count: String(job.execution_count + 1),
+          }
+          if (job.title) meta.title = job.title
+          if (job.calendar) meta.calendar = job.calendar
+          if (remainingAfter !== undefined) meta.remaining_after = String(remainingAfter)
+          dbg(`tick fire ${job.id}: content=${JSON.stringify(job.text).slice(0, 100)} meta=${JSON.stringify(meta)}`)
+          return mcp.notification({
+            method: 'notifications/claude/channel',
+            params: { content: job.text, meta },
+          }).then(
+            () => { dbg(`tick fire ${job.id}: resolved`) },
+            err => { dbg(`tick fire ${job.id}: REJECTED ${err}`); throw err },
+          )
+        }),
+      )
 
-    let changed = false
-    for (let i = 0; i < due.length; i++) {
-      const job = due[i]
-      const result = results[i]
-      if (result.status === 'rejected') {
-        // Leave the job in place so it retries next tick. Delivery failures
-        // do not count against the re-arm retry budget.
-        process.stderr.write(`scheduler: failed to deliver job ${job.id}: ${result.reason}\n`)
-        continue
-      }
-      const remainingAfter = remainingAfterFire(job)
-      job.execution_count += 1
-      const exhausted = remainingAfter !== undefined && remainingAfter <= 0
-      if (isRecurring(job) && !exhausted) {
-        try {
-          job.fire_at = nextCalendarFire(job.calendar!, new Date(now))
-          job.retry_count = 0
-        } catch (err) {
-          // Transient analyzer failure? Keep the job at its current fire_at,
-          // bump retry_count, and try again next tick. Only drop after
-          // MAX_REARM_RETRIES consecutive failures to avoid silent data loss
-          // on a temporary systemd-analyze hiccup.
-          const retries = (job.retry_count ?? 0) + 1
-          job.retry_count = retries
-          if (retries >= MAX_REARM_RETRIES) {
-            process.stderr.write(
-              `scheduler: dropping ${job.id} (${job.calendar}) after ${retries} re-arm failures: ${err}\n`,
-            )
+      let changed = false
+      for (let i = 0; i < due.length; i++) {
+        const job = due[i]
+        const result = results[i]
+        if (result.status === 'rejected') {
+          // Track delivery failures — drop the job after MAX_DELIVERY_FAILURES
+          // consecutive failures to prevent infinite retry loops.
+          const failures = (job.delivery_failures ?? 0) + 1
+          job.delivery_failures = failures
+          if (failures >= MAX_DELIVERY_FAILURES) {
+            process.stderr.write(`scheduler: dropping job ${job.id} after ${failures} consecutive delivery failures\n`)
             store.jobs = store.jobs.filter(j => j.id !== job.id)
           } else {
-            process.stderr.write(
-              `scheduler: re-arm failure ${retries}/${MAX_REARM_RETRIES} for ${job.id} (${job.calendar}): ${err} — leaving in place\n`,
-            )
+            process.stderr.write(`scheduler: delivery failure ${failures}/${MAX_DELIVERY_FAILURES} for job ${job.id}: ${result.reason}\n`)
           }
+          changed = true
+          continue
         }
-      } else {
-        store.jobs = store.jobs.filter(j => j.id !== job.id)
+        const remainingAfter = remainingAfterFire(job)
+        job.execution_count += 1
+        job.delivery_failures = 0
+        const exhausted = remainingAfter !== undefined && remainingAfter <= 0
+        if (isRecurring(job) && !exhausted) {
+          try {
+            job.fire_at = nextCalendarFire(job.calendar!, new Date())
+            job.retry_count = 0
+          } catch (err) {
+            // Transient analyzer failure? Keep the job at its current fire_at,
+            // bump retry_count, and try again next tick. Only drop after
+            // MAX_REARM_RETRIES consecutive failures to avoid silent data loss
+            // on a temporary systemd-analyze hiccup.
+            const retries = (job.retry_count ?? 0) + 1
+            job.retry_count = retries
+            if (retries >= MAX_REARM_RETRIES) {
+              process.stderr.write(
+                `scheduler: dropping ${job.id} (${job.calendar}) after ${retries} re-arm failures: ${err}\n`,
+              )
+              store.jobs = store.jobs.filter(j => j.id !== job.id)
+            } else {
+              process.stderr.write(
+                `scheduler: re-arm failure ${retries}/${MAX_REARM_RETRIES} for ${job.id} (${job.calendar}): ${err} — leaving in place\n`,
+              )
+            }
+          }
+        } else {
+          store.jobs = store.jobs.filter(j => j.id !== job.id)
+        }
+        changed = true
       }
-      changed = true
-    }
-    if (changed) saveJobs(store)
+      if (changed) saveJobs(store)
+    })
   } finally {
     ticking = false
   }
@@ -471,15 +493,24 @@ function rewriteStartupJobs(): void {
   dbg(`rewriteStartupJobs: ${startup.length} startup jobs rewritten to fire at ${new Date(fireAt).toISOString()} (${STARTUP_FIRE_DELAY_MS}ms from now)`)
 }
 
-dbg(`scheduler booting v0.2.7 (pid ${process.pid})`)
+dbg(`scheduler booting v0.2.10 (pid ${process.pid})`)
 rewriteStartupJobs()
 await mcp.connect(new StdioServerTransport())
 dbg(`mcp.connect() returned; polling every ${POLL_MS}ms`)
 process.stderr.write(`scheduler: started, polling every ${POLL_MS}ms\n`)
 
-setInterval(() => {
+const tickInterval = setInterval(() => {
   tick().catch(err => process.stderr.write(`scheduler tick error: ${err}\n`))
 }, POLL_MS)
+
+// Clean shutdown: clear the interval so ticks stop when the process is asked
+// to exit. Without this, the interval keeps the event loop alive forever.
+function shutdown() {
+  clearInterval(tickInterval)
+  process.exit(0)
+}
+process.on('SIGTERM', shutdown)
+process.on('SIGINT', shutdown)
 
 // Sweep overdue one-shot / recurring jobs right away so they don't wait a
 // full poll interval. Startup-rewritten jobs will NOT fire here because
