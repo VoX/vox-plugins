@@ -98,7 +98,6 @@ try {
 function saveUsernameCache(): void {
   if (!usernameCacheDirty) return
   try {
-    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
     const tmp = USERNAME_CACHE_FILE + '.tmp'
     writeFileSync(tmp, JSON.stringify(Object.fromEntries(usernameCache), null, 2) + '\n', { mode: 0o600 })
     renameSync(tmp, USERNAME_CACHE_FILE)
@@ -124,11 +123,8 @@ function cacheFromMessage(msg: Message): void {
   for (const [, user] of msg.mentions.users) {
     cacheUsername(user.id, user.displayName)
   }
-  // Cache role names from the guild if available.
-  if (msg.guild) {
-    for (const [, role] of msg.mentions.roles) {
-      cacheUsername(role.id, role.name)
-    }
+  for (const [, role] of msg.mentions.roles) {
+    cacheUsername(role.id, role.name)
   }
 }
 
