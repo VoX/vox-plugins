@@ -81,6 +81,66 @@ if (!TOKEN) {
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 mkdirSync(INBOX_DIR, { recursive: true })
 
+// --- Username cache for mention resolution ---
+// Maps Discord user/role IDs to display names so <@ID> mentions in message
+// bodies can be annotated before delivery to Claude.
+const USERNAME_CACHE_FILE = join(STATE_DIR, 'username-cache.json')
+const usernameCache = new Map<string, string>()
+let usernameCacheDirty = false
+
+// Load persisted cache from disk.
+try {
+  const raw = readFileSync(USERNAME_CACHE_FILE, 'utf8')
+  const obj = JSON.parse(raw) as Record<string, string>
+  for (const [id, name] of Object.entries(obj)) usernameCache.set(id, name)
+} catch {}
+
+function saveUsernameCache(): void {
+  if (!usernameCacheDirty) return
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    const tmp = USERNAME_CACHE_FILE + '.tmp'
+    writeFileSync(tmp, JSON.stringify(Object.fromEntries(usernameCache), null, 2) + '\n', { mode: 0o600 })
+    renameSync(tmp, USERNAME_CACHE_FILE)
+    usernameCacheDirty = false
+  } catch (e) {
+    process.stderr.write(`discord: username cache save failed: ${e}\n`)
+  }
+}
+
+// Debounced save — flush dirty cache every 30s instead of per-message.
+setInterval(saveUsernameCache, 30_000).unref()
+
+function cacheUsername(id: string, name: string): void {
+  if (usernameCache.get(id) !== name) {
+    usernameCache.set(id, name)
+    usernameCacheDirty = true
+  }
+}
+
+// Populate cache from a message's author + mentioned users + guild roles.
+function cacheFromMessage(msg: Message): void {
+  cacheUsername(msg.author.id, msg.author.displayName)
+  for (const [, user] of msg.mentions.users) {
+    cacheUsername(user.id, user.displayName)
+  }
+  // Cache role names from the guild if available.
+  if (msg.guild) {
+    for (const [, role] of msg.mentions.roles) {
+      cacheUsername(role.id, role.name)
+    }
+  }
+}
+
+// Replace <@ID>, <@!ID>, and <@&ID> mentions with annotated versions
+// using cached display names.
+function resolveMentions(text: string): string {
+  return text.replace(/<@[!&]?(\d+)>/g, (match, id: string) => {
+    const name = usernameCache.get(id)
+    return name ? `${match} (${name})` : match
+  })
+}
+
 // Startup cleanup: delete inbox files older than 24 hours.
 try {
   const cutoff = Date.now() - 24 * 60 * 60 * 1000
@@ -1093,6 +1153,7 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('discord channel: shutting down\n')
+  saveUsernameCache()
   setTimeout(() => process.exit(0), 2000)
   void Promise.resolve(client.destroy()).finally(() => process.exit(0))
 }
@@ -1578,6 +1639,8 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 client.on('messageCreate', msg => {
   // Skip our own messages to avoid loops, but allow other bots through.
   if (msg.author.id === client.user?.id) return
+  // Populate username cache from every message we see (even ones we won't deliver).
+  cacheFromMessage(msg)
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
 })
 
@@ -1667,10 +1730,11 @@ async function handleInbound(msg: Message): Promise<void> {
     ? `(sticker: ${[...msg.stickers.values()].map(s => s.name).join(', ')})`
     : ''
   const embedLabel = msg.embeds.length > 0 ? '(embed)' : ''
-  const content = msg.content
+  const rawContent = msg.content
     || stickerLabel
     || (atts.length > 0 ? '(attachment)' : '')
     || embedLabel
+  const content = resolveMentions(rawContent)
 
   // Reply-to context: if this message is a reply, fetch the referenced message
   let replyMeta: Record<string, string> = {}
@@ -1681,7 +1745,7 @@ async function handleInbound(msg: Message): Promise<void> {
         replyMeta = {
           reply_to: refMsg.id,
           reply_to_author: refMsg.author.username,
-          reply_to_content: refMsg.content?.slice(0, 200) || '',
+          reply_to_content: resolveMentions(refMsg.content?.slice(0, 200) || ''),
         }
       }
     } catch {
