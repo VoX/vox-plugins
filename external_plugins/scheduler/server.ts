@@ -490,27 +490,27 @@ async function tick(): Promise<void> {
 // handshake finishes first but the queue is only ready ~tens of seconds
 // later. Deferring through tick() gives the queue time to come up AND
 // reuses the battle-tested regular delivery path.
-function rewriteStartupJobs(): void {
-  const store = loadJobs()
-  const oneshot = store.jobs.filter(j => j.on_startup === true)
-  const persistent = store.jobs.filter(j => j.persistent_startup === true)
-  if (oneshot.length === 0 && persistent.length === 0) return
-  const fireAt = Date.now() + STARTUP_FIRE_DELAY_MS
-  for (const job of oneshot) {
-    job.fire_at = fireAt
-    delete job.on_startup
-  }
-  for (const job of persistent) {
-    job.fire_at = fireAt
-    // Do NOT clear persistent_startup — it must survive so tick() resets
-    // fire_at=0 after firing, ready for the next boot.
-  }
-  saveJobs(store)
-  dbg(`rewriteStartupJobs: ${oneshot.length} one-shot + ${persistent.length} persistent startup jobs rewritten to fire at ${new Date(fireAt).toISOString()} (${STARTUP_FIRE_DELAY_MS}ms from now)`)
+async function rewriteStartupJobs(): Promise<void> {
+  await withJobMutex(async () => {
+    const store = loadJobs()
+    const oneshot = store.jobs.filter(j => j.on_startup === true)
+    const persistent = store.jobs.filter(j => j.persistent_startup === true)
+    if (oneshot.length === 0 && persistent.length === 0) return
+    const fireAt = Date.now() + STARTUP_FIRE_DELAY_MS
+    for (const job of oneshot) {
+      job.fire_at = fireAt
+      delete job.on_startup
+    }
+    for (const job of persistent) {
+      job.fire_at = fireAt
+    }
+    saveJobs(store)
+    dbg(`rewriteStartupJobs: ${oneshot.length} one-shot + ${persistent.length} persistent startup jobs rewritten to fire at ${new Date(fireAt).toISOString()} (${STARTUP_FIRE_DELAY_MS}ms from now)`)
+  })
 }
 
 dbg(`scheduler booting v0.2.12 (pid ${process.pid})`)
-rewriteStartupJobs()
+await rewriteStartupJobs()
 await mcp.connect(new StdioServerTransport())
 dbg(`mcp.connect() returned; polling every ${POLL_MS}ms`)
 process.stderr.write(`scheduler: started, polling every ${POLL_MS}ms\n`)
