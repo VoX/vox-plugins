@@ -61,7 +61,7 @@ log "firing curl (backgrounded)"
     -X POST "https://discord.com/api/v10/channels/${CHAT_ID}/messages" \
     -H "Authorization: Bot ${TOKEN}" \
     -H "Content-Type: application/json" \
-    -d '{"content":"🔄 compacting context — older turns are being summarized."}' \
+    -d '{"content":"🔄 compacting context — older turns are being dunked."}' \
     --max-time 4 2>/dev/null || echo "curl_err")
   T1=$(date -u +'%Y-%m-%dT%H:%M:%S.%3NZ')
   printf '%s bg curl done http=%s started=%s ended=%s\n' "$T1" "$HTTP_CODE" "$T0" "$T1" >> "$LOG_FILE" 2>/dev/null || true
