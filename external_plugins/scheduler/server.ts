@@ -28,7 +28,7 @@ import { spawnSync } from 'child_process'
 // still see the MCP server respond, but with zero tools and no scheduler
 // polling/IO — nothing fires, nothing persists.
 if (process.env.VOX_PLUGINS_ENABLED !== '1') {
-  const idle = new Server({ name: 'scheduler', version: '0.2.10' }, { capabilities: { tools: {} } })
+  const idle = new Server({ name: 'scheduler', version: '0.2.12' }, { capabilities: { tools: {} } })
   idle.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
   await idle.connect(new StdioServerTransport())
   await new Promise<never>(() => {})
@@ -71,6 +71,7 @@ type Job = {
   retry_count?: number
   delivery_failures?: number
   on_startup?: boolean
+  persistent_startup?: boolean
 }
 
 const MAX_REARM_RETRIES = 3
@@ -180,7 +181,7 @@ function describeWhen(fireAt: number): string {
 }
 
 const mcp = new Server(
-  { name: 'scheduler', version: '0.2.10' },
+  { name: 'scheduler', version: '0.2.12' },
   {
     capabilities: {
       tools: {},
@@ -195,6 +196,7 @@ const mcp = new Server(
       '  - `at` — ISO-8601 timestamp for a one-shot fire (e.g. "2026-04-17T09:00:00Z")',
       '  - `calendar` — systemd calendar expression for recurring fires',
       '  - `on_startup` — fires once on the next scheduler server startup, then deletes itself. Useful for auto-triggering a turn after you restart yourself.',
+      '  - `persistent_startup` — fires on every scheduler server startup and is never auto-deleted. Only `cancel` removes it.',
       '',
       'Calendar examples (all UTC):',
       '  "*-*-* 09:00:00"      daily at 09:00 UTC',
@@ -215,7 +217,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: 'schedule',
-      description: 'Schedule a message to be delivered back into this Claude session. Provide exactly one of `at` (ISO-8601 for one-shot), `calendar` (systemd calendar expression for recurring), or `on_startup` (fires once on next scheduler server startup, then deletes itself). Returns the job id.',
+      description: 'Schedule a message to be delivered back into this Claude session. Provide exactly one of `at` (ISO-8601 for one-shot), `calendar` (systemd calendar expression for recurring), `on_startup` (fires once on next scheduler server startup, then deletes itself), or `persistent_startup` (fires on every server startup, never auto-deleted). Returns the job id.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -230,7 +232,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           on_startup: {
             type: 'boolean',
-            description: 'If true, fires once on the next scheduler server startup and then deletes itself. Useful to auto-trigger a turn after restarting yourself. Mutually exclusive with at and calendar.',
+            description: 'If true, fires once on the next scheduler server startup and then deletes itself. Useful to auto-trigger a turn after restarting yourself. Mutually exclusive with at, calendar, and persistent_startup.',
+          },
+          persistent_startup: {
+            type: 'boolean',
+            description: 'If true, fires on every scheduler server startup and is never auto-deleted — only cancel removes it. Mutually exclusive with at, calendar, and on_startup.',
           },
           max_executions: {
             type: 'number',
@@ -268,9 +274,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     const at = typeof args.at === 'string' && args.at.trim() ? args.at.trim() : undefined
     const calendar = typeof args.calendar === 'string' && args.calendar.trim() ? args.calendar.trim() : undefined
     const on_startup = args.on_startup === true
-    const picked = [at ? 'at' : null, calendar ? 'calendar' : null, on_startup ? 'on_startup' : null].filter(Boolean)
-    if (picked.length === 0) throw new Error('provide at (one-shot ISO-8601), calendar (systemd calendar expression), or on_startup (fire on next server startup)')
-    if (picked.length > 1) throw new Error(`provide only one of at, calendar, or on_startup (got ${picked.join(', ')})`)
+    const persistent_startup = args.persistent_startup === true
+    const picked = [at ? 'at' : null, calendar ? 'calendar' : null, on_startup ? 'on_startup' : null, persistent_startup ? 'persistent_startup' : null].filter(Boolean)
+    if (picked.length === 0) throw new Error('provide at (one-shot ISO-8601), calendar (systemd calendar expression), on_startup (fire on next server startup), or persistent_startup (fire on every server startup)')
+    if (picked.length > 1) throw new Error(`provide only one of at, calendar, on_startup, or persistent_startup (got ${picked.join(', ')})`)
     const title = typeof args.title === 'string' && args.title.trim() ? args.title.trim() : undefined
     const max = typeof args.max_executions === 'number' && args.max_executions > 0
       ? Math.floor(args.max_executions)
@@ -292,8 +299,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     } else if (calendar) {
       fire_at = nextCalendarFire(calendar)
     } else {
-      // on_startup job — fire_at is a sentinel (0). The regular tick ignores
-      // these; rewriteStartupJobs() at server init handles delivery + cleanup.
+      // on_startup / persistent_startup job — fire_at is a sentinel (0). The
+      // regular tick ignores these; rewriteStartupJobs() at server init handles
+      // delivery + cleanup.
       fire_at = 0
     }
 
@@ -307,6 +315,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       ...(calendar ? { calendar } : {}),
       ...(calendar && max ? { max_executions: max } : {}),
       ...(on_startup ? { on_startup: true } : {}),
+      ...(persistent_startup ? { persistent_startup: true } : {}),
     }
     await withJobMutex(async () => {
       const store = loadJobs()
@@ -315,6 +324,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     })
     const lines = on_startup
       ? [`${job.id} — fires on next scheduler startup`]
+      : persistent_startup
+      ? [`${job.id} — fires on every scheduler startup`]
       : [`${job.id} — fires in ${describeWhen(job.fire_at)} at ${new Date(job.fire_at).toISOString()}`]
     if (calendar) {
       lines.push(`recurring: ${calendar}`)
@@ -327,15 +338,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   if (name === 'list_scheduled') {
     const store = loadJobs()
     if (store.jobs.length === 0) return { content: [{ type: 'text', text: 'no scheduled jobs' }] }
-    // on_startup jobs have fire_at=0 as a sentinel — sort them to the top
-    // so they're visible above scheduled work.
+    // on_startup / persistent_startup jobs have fire_at=0 as a sentinel —
+    // sort them to the top so they're visible above scheduled work.
+    const isStartupish = (j: Job) => j.on_startup || j.persistent_startup
     const sorted = [...store.jobs].sort((a, b) => {
-      if (a.on_startup && !b.on_startup) return -1
-      if (!a.on_startup && b.on_startup) return 1
+      if (isStartupish(a) && !isStartupish(b)) return -1
+      if (!isStartupish(a) && isStartupish(b)) return 1
       return a.fire_at - b.fire_at
     })
     const lines = sorted.map(j => {
-      const when = j.on_startup
+      const when = j.persistent_startup
+        ? 'every startup'
+        : j.on_startup
         ? 'on next startup'
         : `${describeWhen(j.fire_at)} (${new Date(j.fire_at).toISOString()})`
       const rec = j.calendar ? ` [${j.calendar}]` : ''
@@ -377,10 +391,10 @@ async function tick(): Promise<void> {
       const store = loadJobs()
       if (store.jobs.length === 0) return
       const now = Date.now()
-      // on_startup jobs created after boot still carry the flag and
-      // fire_at=0 sentinel — skip them so they only fire after a restart.
-      // rewriteStartupJobs() clears the flag at boot.
-      const due = store.jobs.filter(j => !j.on_startup && j.fire_at <= now)
+      // on_startup / persistent_startup jobs created after boot still carry
+      // their flag and fire_at=0 sentinel — skip them so they only fire
+      // after a restart. rewriteStartupJobs() handles delivery at boot.
+      const due = store.jobs.filter(j => !j.on_startup && !j.persistent_startup && j.fire_at <= now)
       if (due.length === 0) return
 
       dbg(`tick: ${due.length} due`)
@@ -429,7 +443,11 @@ async function tick(): Promise<void> {
         job.execution_count += 1
         job.delivery_failures = 0
         const exhausted = remainingAfter !== undefined && remainingAfter <= 0
-        if (job.calendar !== undefined && !exhausted) {
+        if (job.persistent_startup) {
+          // Persistent startup job — reset fire_at to sentinel so it waits
+          // for next boot. Never auto-deleted.
+          job.fire_at = 0
+        } else if (job.calendar !== undefined && !exhausted) {
           try {
             job.fire_at = nextCalendarFire(job.calendar!, new Date())
             job.retry_count = 0
@@ -471,18 +489,24 @@ async function tick(): Promise<void> {
 // reuses the battle-tested regular delivery path.
 function rewriteStartupJobs(): void {
   const store = loadJobs()
-  const startup = store.jobs.filter(j => j.on_startup === true)
-  if (startup.length === 0) return
+  const oneshot = store.jobs.filter(j => j.on_startup === true)
+  const persistent = store.jobs.filter(j => j.persistent_startup === true)
+  if (oneshot.length === 0 && persistent.length === 0) return
   const fireAt = Date.now() + STARTUP_FIRE_DELAY_MS
-  for (const job of startup) {
+  for (const job of oneshot) {
     job.fire_at = fireAt
     delete job.on_startup
   }
+  for (const job of persistent) {
+    job.fire_at = fireAt
+    // Do NOT clear persistent_startup — it must survive so tick() resets
+    // fire_at=0 after firing, ready for the next boot.
+  }
   saveJobs(store)
-  dbg(`rewriteStartupJobs: ${startup.length} startup jobs rewritten to fire at ${new Date(fireAt).toISOString()} (${STARTUP_FIRE_DELAY_MS}ms from now)`)
+  dbg(`rewriteStartupJobs: ${oneshot.length} one-shot + ${persistent.length} persistent startup jobs rewritten to fire at ${new Date(fireAt).toISOString()} (${STARTUP_FIRE_DELAY_MS}ms from now)`)
 }
 
-dbg(`scheduler booting v0.2.10 (pid ${process.pid})`)
+dbg(`scheduler booting v0.2.12 (pid ${process.pid})`)
 rewriteStartupJobs()
 await mcp.connect(new StdioServerTransport())
 dbg(`mcp.connect() returned; polling every ${POLL_MS}ms`)
