@@ -88,9 +88,6 @@ function withJobMutex<T>(fn: () => Promise<T>): Promise<T> {
 
 type JobStore = { jobs: Job[] }
 
-const remainingAfterFire = (j: Job): number | undefined =>
-  j.max_executions !== undefined ? j.max_executions - (j.execution_count + 1) : undefined
-
 function loadJobs(): JobStore {
   try {
     return JSON.parse(readFileSync(JOBS_FILE, 'utf8')) as JobStore
@@ -275,7 +272,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     const calendar = typeof args.calendar === 'string' && args.calendar.trim() ? args.calendar.trim() : undefined
     const on_startup = args.on_startup === true
     const persistent_startup = args.persistent_startup === true
-    const picked = [at ? 'at' : null, calendar ? 'calendar' : null, on_startup ? 'on_startup' : null, persistent_startup ? 'persistent_startup' : null].filter(Boolean)
+    const picked = [at && 'at', calendar && 'calendar', on_startup && 'on_startup', persistent_startup && 'persistent_startup'].filter(Boolean)
     if (picked.length === 0) throw new Error('provide at (one-shot ISO-8601), calendar (systemd calendar expression), on_startup (fire on next server startup), or persistent_startup (fire on every server startup)')
     if (picked.length > 1) throw new Error(`provide only one of at, calendar, on_startup, or persistent_startup (got ${picked.join(', ')})`)
     const title = typeof args.title === 'string' && args.title.trim() ? args.title.trim() : undefined
@@ -311,8 +308,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       text,
       execution_count: 0,
       created_at: Date.now(),
-      ...(title ? { title } : {}),
-      ...(calendar ? { calendar } : {}),
+      title,
+      calendar,
       ...(calendar && max ? { max_executions: max } : {}),
       ...(on_startup ? { on_startup: true } : {}),
       ...(persistent_startup ? { persistent_startup: true } : {}),
@@ -338,14 +335,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   if (name === 'list_scheduled') {
     const store = loadJobs()
     if (store.jobs.length === 0) return { content: [{ type: 'text', text: 'no scheduled jobs' }] }
-    // on_startup / persistent_startup jobs have fire_at=0 as a sentinel —
-    // sort them to the top so they're visible above scheduled work.
-    const isStartupish = (j: Job) => j.on_startup || j.persistent_startup
-    const sorted = [...store.jobs].sort((a, b) => {
-      if (isStartupish(a) && !isStartupish(b)) return -1
-      if (!isStartupish(a) && isStartupish(b)) return 1
-      return a.fire_at - b.fire_at
-    })
+    // Startup jobs carry fire_at=0, so a plain numeric sort naturally
+    // floats them to the top above scheduled work.
+    const sorted = [...store.jobs].sort((a, b) => a.fire_at - b.fire_at)
     const lines = sorted.map(j => {
       const when = j.persistent_startup
         ? 'every startup'
@@ -407,7 +399,6 @@ async function tick(): Promise<void> {
       // block other due jobs for this tick.
       const results = await Promise.allSettled(
         due.map(job => {
-          const remainingAfter = remainingAfterFire(job)
           const meta: Record<string, string> = {
             scheduled_id: job.id,
             fired_at: new Date(now).toISOString(),
@@ -416,7 +407,9 @@ async function tick(): Promise<void> {
           }
           if (job.title) meta.title = job.title
           if (job.calendar) meta.calendar = job.calendar
-          if (remainingAfter !== undefined) meta.remaining_after = String(remainingAfter)
+          if (job.max_executions !== undefined) {
+            meta.remaining_after = String(job.max_executions - (job.execution_count + 1))
+          }
           dbg(`tick fire ${job.id}: content=${JSON.stringify(job.text).slice(0, 100)} meta=${JSON.stringify(meta)}`)
           return mcp.notification({
             method: 'notifications/claude/channel',
@@ -432,8 +425,6 @@ async function tick(): Promise<void> {
         const job = due[i]
         const result = results[i]
         if (result.status === 'rejected') {
-          // Track delivery failures — drop the job after MAX_DELIVERY_FAILURES
-          // consecutive failures to prevent infinite retry loops.
           const failures = (job.delivery_failures ?? 0) + 1
           job.delivery_failures = failures
           if (failures >= MAX_DELIVERY_FAILURES) {
@@ -444,10 +435,9 @@ async function tick(): Promise<void> {
           }
           continue
         }
-        const remainingAfter = remainingAfterFire(job)
         job.execution_count += 1
         job.delivery_failures = 0
-        const exhausted = remainingAfter !== undefined && remainingAfter <= 0
+        const exhausted = job.max_executions !== undefined && job.execution_count >= job.max_executions
         if (job.calendar !== undefined && !exhausted) {
           try {
             job.fire_at = nextCalendarFire(job.calendar, new Date())
@@ -493,19 +483,21 @@ async function tick(): Promise<void> {
 async function rewriteStartupJobs(): Promise<void> {
   await withJobMutex(async () => {
     const store = loadJobs()
-    const oneshot = store.jobs.filter(j => j.on_startup === true)
-    const persistent = store.jobs.filter(j => j.persistent_startup === true)
-    if (oneshot.length === 0 && persistent.length === 0) return
     const fireAt = Date.now() + STARTUP_FIRE_DELAY_MS
-    for (const job of oneshot) {
-      job.fire_at = fireAt
-      delete job.on_startup
+    let oneshot = 0, persistent = 0
+    for (const job of store.jobs) {
+      if (job.on_startup) {
+        job.fire_at = fireAt
+        delete job.on_startup
+        oneshot++
+      } else if (job.persistent_startup) {
+        job.fire_at = fireAt
+        persistent++
+      }
     }
-    for (const job of persistent) {
-      job.fire_at = fireAt
-    }
+    if (oneshot === 0 && persistent === 0) return
     saveJobs(store)
-    dbg(`rewriteStartupJobs: ${oneshot.length} one-shot + ${persistent.length} persistent startup jobs rewritten to fire at ${new Date(fireAt).toISOString()} (${STARTUP_FIRE_DELAY_MS}ms from now)`)
+    dbg(`rewriteStartupJobs: ${oneshot} one-shot + ${persistent} persistent startup jobs rewritten to fire at ${new Date(fireAt).toISOString()} (${STARTUP_FIRE_DELAY_MS}ms from now)`)
   })
 }
 

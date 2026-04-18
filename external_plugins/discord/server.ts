@@ -346,17 +346,7 @@ function readAccessFile(): Access {
   try {
     const raw = readFileSync(ACCESS_FILE, 'utf8')
     const parsed = JSON.parse(raw) as Partial<Access>
-    return {
-      dmPolicy: parsed.dmPolicy ?? 'pairing',
-      allowFrom: parsed.allowFrom ?? [],
-      groups: parsed.groups ?? {},
-      pending: parsed.pending ?? {},
-      mentionPatterns: parsed.mentionPatterns,
-      ackReaction: parsed.ackReaction,
-      replyToMode: parsed.replyToMode,
-      textChunkLimit: parsed.textChunkLimit,
-      chunkMode: parsed.chunkMode,
-    }
+    return { ...defaultAccess(), ...parsed }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
     try { renameSync(ACCESS_FILE, `${ACCESS_FILE}.corrupt-${Date.now()}`) } catch {}
@@ -590,10 +580,9 @@ function checkApprovals(): void {
         if ('send' in ch) {
           await ch.send("Paired! Say hi to Claude.")
         }
-        rmSync(file, { force: true })
       } catch (err) {
         process.stderr.write(`discord channel: failed to send approval confirm: ${err}\n`)
-        // Remove anyway — don't loop on a broken send.
+      } finally {
         rmSync(file, { force: true })
       }
     })()
@@ -670,7 +659,6 @@ async function downloadAttachment(att: Attachment): Promise<string> {
   const rawExt = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : 'bin'
   const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
   const path = join(INBOX_DIR, `${Date.now()}-${att.id}.${ext}`)
-  mkdirSync(INBOX_DIR, { recursive: true })
   writeFileSync(path, buf)
   return path
 }
@@ -687,13 +675,11 @@ const typingIntervals = new Map<string, ReturnType<typeof setInterval>>()
 
 function startTyping(ch: any, chatId: string): void {
   stopTyping(chatId)
-  if ('sendTyping' in ch) {
-    void (ch as any).sendTyping().catch(() => {})
-    const interval = setInterval(() => {
-      void (ch as any).sendTyping().catch(() => {})
-    }, 9000)
-    typingIntervals.set(chatId, interval)
-  }
+  void ch.sendTyping().catch(() => {})
+  const interval = setInterval(() => {
+    void ch.sendTyping().catch(() => {})
+  }, 9000)
+  typingIntervals.set(chatId, interval)
 }
 
 function stopTyping(chatId: string): void {
@@ -1261,9 +1247,8 @@ async function tailJsonlLines(path: string, n: number): Promise<string[]> {
   // Stream-read the tail of a (potentially 100MB+) JSONL. Uses Bun's
   // file API to seek-from-end so we don't load the whole transcript.
   const f = Bun.file(path)
-  const size = f.size
-  const chunkSize = Math.min(size, 256 * 1024)
-  const slice = f.slice(Math.max(0, size - chunkSize), size)
+  const chunkSize = Math.min(f.size, 256 * 1024)
+  const slice = f.slice(Math.max(0, f.size - chunkSize), f.size)
   const text = await slice.text()
   const lines = text.split('\n').filter(l => l.length > 0)
   return lines.slice(-n)
@@ -1274,6 +1259,7 @@ function summarizeTailRaw(lines: string[]): { lastAction: string; lastTs: number
   // assistant text or tool call as a one-liner + the latest timestamp.
   let lastAction = '(no recent activity)'
   let lastTs: number | null = null
+  let foundAction = false
   for (let i = lines.length - 1; i >= 0; i--) {
     let entry
     try { entry = JSON.parse(lines[i]) } catch { continue }
@@ -1281,17 +1267,18 @@ function summarizeTailRaw(lines: string[]): { lastAction: string; lastTs: number
       const t = Date.parse(entry.timestamp)
       if (!Number.isNaN(t) && (lastTs === null || t > lastTs)) lastTs = t
     }
-    if (lastAction !== '(no recent activity)') continue
+    if (foundAction) continue
     const content = entry.message?.content
     if (Array.isArray(content)) {
       for (const c of content) {
         if (c.type === 'text' && typeof c.text === 'string' && c.text.trim()) {
           lastAction = c.text.replace(/\s+/g, ' ').slice(0, 200)
+          foundAction = true
           break
         }
         if (c.type === 'tool_use') {
-          const inputPreview = JSON.stringify(c.input ?? {}).slice(0, 80)
-          lastAction = `tool: ${c.name} ${inputPreview}`
+          lastAction = `tool: ${c.name} ${JSON.stringify(c.input ?? {}).slice(0, 80)}`
+          foundAction = true
           break
         }
       }
@@ -1548,55 +1535,51 @@ async function buildStatusReply(): Promise<string> {
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
 // Security mirrors the text-reply path: allowFrom must contain the sender.
 client.on('interactionCreate', async (interaction: Interaction) => {
-  // /status slash command — ephemeral status check, anyone can invoke.
-  if (interaction.isChatInputCommand() && interaction.commandName === 'status') {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {})
-    try {
-      const reply = await buildStatusReply()
-      await interaction.editReply({ content: reply.slice(0, 1900) }).catch(() => {})
-    } catch (e) {
-      await interaction.editReply({ content: `status failed: ${String(e).slice(0, 200)}` }).catch(() => {})
-    }
-    return
-  }
+  // Slash commands — early dispatch.
+  if (interaction.isChatInputCommand()) {
+    const cmd = interaction.commandName
 
-  // /dunk — silence inbound messages from this channel until /dedunk
-  // (or until the optional `for` duration elapses). Gated to allowFrom
-  // users so a stranger in a shared channel can't permamute the bot.
-  if (interaction.isChatInputCommand() && interaction.commandName === 'dunk') {
-    const access = loadAccess()
-    if (!access.allowFrom.includes(interaction.user.id)) {
-      await interaction.reply({ content: 'Not authorized.', flags: MessageFlags.Ephemeral }).catch(() => {})
+    // /status — ephemeral, anyone can invoke.
+    if (cmd === 'status') {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {})
+      try {
+        const reply = await buildStatusReply()
+        await interaction.editReply({ content: reply.slice(0, 1900) }).catch(() => {})
+      } catch (e) {
+        await interaction.editReply({ content: `status failed: ${String(e).slice(0, 200)}` }).catch(() => {})
+      }
       return
     }
-    const forStr = interaction.options.getString('for') ?? null
-    const allowMentions = interaction.options.getBoolean('allow_mentions') ?? false
-    const result = applyDunk(interaction.channelId, interaction.user.username, forStr, allowMentions)
-    if (!result.ok) {
-      await interaction.reply({ content: result.msg, flags: MessageFlags.Ephemeral }).catch(() => {})
-      return
-    }
-    await interaction.reply({
-      content: `🔇 ${result.msg}. use \`/dedunk\` to undo.`,
-      flags: MessageFlags.Ephemeral,
-    }).catch(() => {})
-    return
-  }
 
-  // /dedunk — re-enable message forwarding for this channel. No-op
-  // confirm when the channel wasn't dunked.
-  if (interaction.isChatInputCommand() && interaction.commandName === 'dedunk') {
-    const access = loadAccess()
-    if (!access.allowFrom.includes(interaction.user.id)) {
-      await interaction.reply({ content: 'Not authorized.', flags: MessageFlags.Ephemeral }).catch(() => {})
+    // /dunk, /dedunk — gated to allowFrom users.
+    if (cmd === 'dunk' || cmd === 'dedunk') {
+      const access = loadAccess()
+      if (!access.allowFrom.includes(interaction.user.id)) {
+        await interaction.reply({ content: 'Not authorized.', flags: MessageFlags.Ephemeral }).catch(() => {})
+        return
+      }
+      if (cmd === 'dunk') {
+        const allowMentions = interaction.options.getBoolean('allow_mentions') ?? false
+        const result = applyDunk(interaction.channelId, interaction.user.username, interaction.options.getString('for'), allowMentions)
+        if (!result.ok) {
+          await interaction.reply({ content: result.msg, flags: MessageFlags.Ephemeral }).catch(() => {})
+          return
+        }
+        await interaction.reply({
+          content: `🔇 ${result.msg}. use \`/dedunk\` to undo.`,
+          flags: MessageFlags.Ephemeral,
+        }).catch(() => {})
+      } else {
+        const undunkMsg = applyUndunk(interaction.channelId)
+        await interaction.reply({
+          content: undunkMsg.includes('was not dunked')
+            ? '🔊 channel wasn\'t silenced — nothing to undo.'
+            : '🔊 channel un-silenced. messages will reach the bot again.',
+          flags: MessageFlags.Ephemeral,
+        }).catch(() => {})
+      }
       return
     }
-    const msg = applyUndunk(interaction.channelId)
-    const wasNotDunked = msg.includes('was not dunked')
-    await interaction.reply({
-      content: wasNotDunked ? '🔊 channel wasn\'t silenced — nothing to undo.' : '🔊 channel un-silenced. messages will reach the bot again.',
-      flags: MessageFlags.Ephemeral,
-    }).catch(() => {})
     return
   }
 
@@ -1743,9 +1726,8 @@ async function handleInbound(msg: Message): Promise<void> {
   // the bot decides not to respond, making it look like it's always typing.
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
-  const access = result.access
-  if (access.ackReaction) {
-    void msg.react(access.ackReaction).catch(() => {})
+  if (result.access.ackReaction) {
+    void msg.react(result.access.ackReaction).catch(() => {})
   }
 
   // Attachments are listed (name/type/size) but not downloaded — the model
@@ -1774,12 +1756,10 @@ async function handleInbound(msg: Message): Promise<void> {
   if (msg.reference?.messageId) {
     try {
       const refMsg = await msg.channel.messages.fetch(msg.reference.messageId)
-      if (refMsg) {
-        replyMeta = {
-          reply_to: refMsg.id,
-          reply_to_author: refMsg.author.username,
-          reply_to_content: resolveMentions(refMsg.content?.slice(0, 200) || ''),
-        }
+      replyMeta = {
+        reply_to: refMsg.id,
+        reply_to_author: refMsg.author.username,
+        reply_to_content: resolveMentions(refMsg.content?.slice(0, 200) || ''),
       }
     } catch {
       // Referenced message may have been deleted — silently skip
