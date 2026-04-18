@@ -391,10 +391,15 @@ async function tick(): Promise<void> {
       const store = loadJobs()
       if (store.jobs.length === 0) return
       const now = Date.now()
-      // on_startup / persistent_startup jobs created after boot still carry
-      // their flag and fire_at=0 sentinel — skip them so they only fire
-      // after a restart. rewriteStartupJobs() handles delivery at boot.
-      const due = store.jobs.filter(j => !j.on_startup && !j.persistent_startup && j.fire_at <= now)
+      // on_startup jobs created after boot still carry fire_at=0 — skip.
+      // persistent_startup jobs with fire_at=0 are waiting for next boot — skip.
+      // persistent_startup jobs with fire_at>0 were rewritten by rewriteStartupJobs
+      // and are ready to fire — let them through.
+      const due = store.jobs.filter(j => {
+        if (j.on_startup) return false
+        if (j.persistent_startup && j.fire_at === 0) return false
+        return j.fire_at <= now
+      })
       if (due.length === 0) return
 
       dbg(`tick: ${due.length} due`)
@@ -443,13 +448,9 @@ async function tick(): Promise<void> {
         job.execution_count += 1
         job.delivery_failures = 0
         const exhausted = remainingAfter !== undefined && remainingAfter <= 0
-        if (job.persistent_startup) {
-          // Persistent startup job — reset fire_at to sentinel so it waits
-          // for next boot. Never auto-deleted.
-          job.fire_at = 0
-        } else if (job.calendar !== undefined && !exhausted) {
+        if (job.calendar !== undefined && !exhausted) {
           try {
-            job.fire_at = nextCalendarFire(job.calendar!, new Date())
+            job.fire_at = nextCalendarFire(job.calendar, new Date())
             job.retry_count = 0
           } catch (err) {
             // Transient analyzer failure? Keep the job at its current fire_at,
@@ -469,6 +470,8 @@ async function tick(): Promise<void> {
               )
             }
           }
+        } else if (job.persistent_startup) {
+          job.fire_at = 0
         } else {
           store.jobs = store.jobs.filter(j => j.id !== job.id)
         }
