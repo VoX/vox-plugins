@@ -519,6 +519,8 @@ function shutdown() {
 }
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
+process.stdin.on('end', shutdown)
+process.stdin.on('close', shutdown)
 
 // Sweep overdue one-shot / recurring jobs right away so they don't wait a
 // full poll interval. Startup-rewritten jobs will NOT fire here because
