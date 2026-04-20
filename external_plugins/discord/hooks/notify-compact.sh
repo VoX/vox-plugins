@@ -1,16 +1,10 @@
 #!/usr/bin/env bash
-# PreCompact hook — fires a one-line "compacting" notice to the Discord
-# channel that last pinged the plugin. Best-effort: any failure must
-# exit 0 so a missing chat_id, network blip, or rate-limit does NOT
-# block the actual compaction.
+# PreCompact hook — fires a compaction notice to the Discord channel
+# that most recently sent a message in this session's transcript.
+# Best-effort: any failure exits 0 so it never blocks compaction.
 #
-# Single-session only. Claude Code does not expose session_id to MCP
-# servers, so the plugin writes the last chat_id to one shared path
-# per user: ${DISCORD_STATE_DIR:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/channels/discord}/
-# sessions/default/last_chat_id.txt. Two concurrent claude sessions on
-# the same user will overwrite each other's pointer; whoever DM'd last
-# wins. Matches the server-side write in server.ts. When anthropic
-# exposes a session_id to plugins/MCP, both sides can switch.
+# Derives chat_id from transcript_path (in the hook payload) by
+# scanning for the last Discord message. No file-based state needed.
 #
 # Mute via env: `COMPACT_NOTIFY_DISABLED=1` skips the post entirely.
 
@@ -49,7 +43,7 @@ fi
 
 CHAT_ID="$(tac "$TRANSCRIPT" 2>/dev/null \
   | grep -m1 'source="plugin:discord:discord" chat_id="' \
-  | grep -oP 'chat_id="\K[0-9]+')"
+  | grep -oE 'chat_id="[0-9]+"' | head -1 | grep -oE '[0-9]+')"
 [ -n "$CHAT_ID" ] || { log "skip: no Discord chat_id found in transcript"; exit 0; }
 log "resolved chat_id=$CHAT_ID from transcript"
 
