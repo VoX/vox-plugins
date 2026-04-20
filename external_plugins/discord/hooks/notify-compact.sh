@@ -54,14 +54,29 @@ TOKEN="$(grep -E '^DISCORD_BOT_TOKEN=' "$ENV_FILE" | head -1 | cut -d= -f2- \
   | sed -E 's/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/')"
 [ -n "$TOKEN" ] || { log "skip: no DISCORD_BOT_TOKEN in env"; exit 0; }
 
-log "firing curl (backgrounded)"
+log "full input: $INPUT"
+
+# Random verb for the compaction message
+VERBS=("dunked" "compacted" "pebbed" "yeeted" "recycled" "composted" "archived" "swept" "crunched" "digested")
+VERB="${VERBS[$((RANDOM % ${#VERBS[@]}))]}"
+
+# Try to extract context length from the hook payload (if available)
+CTX_INFO=""
+if command -v jq >/dev/null 2>&1; then
+  CTX_PCT="$(printf '%s' "$INPUT" | jq -r '.summary.context_pct // .percent_used // empty' 2>/dev/null)"
+  [ -n "$CTX_PCT" ] && CTX_INFO=" (context: ${CTX_PCT}%)"
+fi
+
+MSG="🔄 compacting context${CTX_INFO} — older turns are being ${VERB}."
+
+log "firing curl (backgrounded) verb=$VERB"
 (
   T0=$(date -u +'%Y-%m-%dT%H:%M:%S.%3NZ')
   HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
     -X POST "https://discord.com/api/v10/channels/${CHAT_ID}/messages" \
     -H "Authorization: Bot ${TOKEN}" \
     -H "Content-Type: application/json" \
-    -d '{"content":"🔄 compacting context — older turns are being dunked."}' \
+    -d "{\"content\":\"${MSG}\"}" \
     --max-time 4 2>/dev/null || echo "curl_err")
   T1=$(date -u +'%Y-%m-%dT%H:%M:%S.%3NZ')
   printf '%s bg curl done http=%s started=%s ended=%s\n' "$T1" "$HTTP_CODE" "$T0" "$T1" >> "$LOG_FILE" 2>/dev/null || true
