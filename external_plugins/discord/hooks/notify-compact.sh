@@ -60,15 +60,26 @@ log "full input: $INPUT"
 VERBS=("dunked" "compacted" "pebbed" "yeeted" "recycled" "composted" "archived" "swept" "crunched" "digested")
 VERB="${VERBS[$((RANDOM % ${#VERBS[@]}))]}"
 
-# Get context size from transcript_path
+# Get context token count from transcript_path (same method as /status command)
 CTX_INFO=""
 if command -v jq >/dev/null 2>&1; then
   TRANSCRIPT="$(printf '%s' "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)"
   if [ -n "$TRANSCRIPT" ] && [ -r "$TRANSCRIPT" ]; then
-    SIZE_BYTES="$(stat -c%s "$TRANSCRIPT" 2>/dev/null || stat -f%z "$TRANSCRIPT" 2>/dev/null)"
-    if [ -n "$SIZE_BYTES" ]; then
-      SIZE_MB="$(echo "scale=1; $SIZE_BYTES / 1048576" | bc 2>/dev/null || echo "")"
-      [ -n "$SIZE_MB" ] && CTX_INFO=" (${SIZE_MB}MB)"
+    # Find last line with usage data, sum input_tokens + cache tokens
+    CTX_TOKENS="$(tac "$TRANSCRIPT" 2>/dev/null | grep -m1 '"input_tokens"' | jq -r '
+      (.usage.input_tokens // 0) +
+      (.usage.cache_creation_input_tokens // 0) +
+      (.usage.cache_read_input_tokens // 0)
+    ' 2>/dev/null)"
+    if [ -n "$CTX_TOKENS" ] && [ "$CTX_TOKENS" != "0" ] && [ "$CTX_TOKENS" != "null" ]; then
+      if [ "$CTX_TOKENS" -ge 1000000 ] 2>/dev/null; then
+        CTX_FMT="$(echo "scale=2; $CTX_TOKENS / 1000000" | bc)M tokens"
+      elif [ "$CTX_TOKENS" -ge 1000 ] 2>/dev/null; then
+        CTX_FMT="$(echo "scale=1; $CTX_TOKENS / 1000" | bc)k tokens"
+      else
+        CTX_FMT="${CTX_TOKENS} tokens"
+      fi
+      CTX_INFO=" (${CTX_FMT})"
     fi
   fi
 fi
