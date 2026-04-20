@@ -41,8 +41,14 @@ if command -v jq >/dev/null 2>&1; then
 fi
 [ -n "$TRANSCRIPT" ] && [ -r "$TRANSCRIPT" ] || { log "skip: no transcript at ${TRANSCRIPT:-<empty>}"; exit 0; }
 
-CHAT_ID="$(tac "$TRANSCRIPT" 2>/dev/null \
-  | grep -m1 'source="plugin:discord:discord" chat_id="' \
+# Channel tags live inside queue-operation entries with escaped quotes
+# (JSONL content is "<channel source=\"...\" chat_id=\"...\">"). Use jq
+# to unescape .content, then grep for the last Discord message and
+# extract its chat_id. Filtering by .type avoids picking up assistant
+# tool calls that happen to mention the same source string.
+CHAT_ID="$(jq -rc 'select(.type == "queue-operation") | .content // empty' "$TRANSCRIPT" 2>/dev/null \
+  | grep 'source="plugin:discord:discord"' \
+  | tail -1 \
   | grep -oE 'chat_id="[0-9]+"' | head -1 | grep -oE '[0-9]+')"
 [ -n "$CHAT_ID" ] || { log "skip: no Discord chat_id found in transcript"; exit 0; }
 log "resolved chat_id=$CHAT_ID from transcript"
@@ -61,28 +67,24 @@ log "full input: $INPUT"
 VERBS=("dunked" "compacted" "pebbed" "yeeted" "recycled" "composted" "archived" "swept" "crunched" "digested")
 VERB="${VERBS[$((RANDOM % ${#VERBS[@]}))]}"
 
-# Get context token count from transcript_path (same method as /status command)
+# Context token count — mirror /status: sum input + cache tokens from
+# the latest assistant entry's .message.usage (NOT top-level .usage).
 CTX_INFO=""
-if command -v jq >/dev/null 2>&1; then
-  TRANSCRIPT="$(printf '%s' "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)"
-  if [ -n "$TRANSCRIPT" ] && [ -r "$TRANSCRIPT" ]; then
-    # Find last line with usage data, sum input_tokens + cache tokens
-    CTX_TOKENS="$(tac "$TRANSCRIPT" 2>/dev/null | grep -m1 '"input_tokens"' | jq -r '
-      (.usage.input_tokens // 0) +
-      (.usage.cache_creation_input_tokens // 0) +
-      (.usage.cache_read_input_tokens // 0)
-    ' 2>/dev/null)"
-    if [ -n "$CTX_TOKENS" ] && [ "$CTX_TOKENS" != "0" ] && [ "$CTX_TOKENS" != "null" ]; then
-      if [ "$CTX_TOKENS" -ge 1000000 ] 2>/dev/null; then
-        CTX_FMT="$(echo "scale=2; $CTX_TOKENS / 1000000" | bc)M tokens"
-      elif [ "$CTX_TOKENS" -ge 1000 ] 2>/dev/null; then
-        CTX_FMT="$(echo "scale=1; $CTX_TOKENS / 1000" | bc)k tokens"
-      else
-        CTX_FMT="${CTX_TOKENS} tokens"
-      fi
-      CTX_INFO=" (${CTX_FMT})"
-    fi
+CTX_TOKENS="$(tac "$TRANSCRIPT" 2>/dev/null \
+  | jq -r 'select(.message.role == "assistant" and .message.usage) |
+      (.message.usage.input_tokens // 0) +
+      (.message.usage.cache_creation_input_tokens // 0) +
+      (.message.usage.cache_read_input_tokens // 0)' 2>/dev/null \
+  | head -1)"
+if [ -n "$CTX_TOKENS" ] && [ "$CTX_TOKENS" != "0" ] && [ "$CTX_TOKENS" != "null" ]; then
+  if [ "$CTX_TOKENS" -ge 1000000 ] 2>/dev/null; then
+    CTX_FMT="$(echo "scale=2; $CTX_TOKENS / 1000000" | bc)M tokens"
+  elif [ "$CTX_TOKENS" -ge 1000 ] 2>/dev/null; then
+    CTX_FMT="$(echo "scale=1; $CTX_TOKENS / 1000" | bc)k tokens"
+  else
+    CTX_FMT="${CTX_TOKENS} tokens"
   fi
+  CTX_INFO=" (${CTX_FMT})"
 fi
 
 MSG="🔄 compacting context${CTX_INFO} — older turns are being ${VERB}."
