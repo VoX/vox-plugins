@@ -60,11 +60,17 @@ log "full input: $INPUT"
 VERBS=("dunked" "compacted" "pebbed" "yeeted" "recycled" "composted" "archived" "swept" "crunched" "digested")
 VERB="${VERBS[$((RANDOM % ${#VERBS[@]}))]}"
 
-# Try to extract context length from the hook payload (if available)
+# Get context size from transcript_path
 CTX_INFO=""
 if command -v jq >/dev/null 2>&1; then
-  CTX_PCT="$(printf '%s' "$INPUT" | jq -r '.summary.context_pct // .percent_used // empty' 2>/dev/null)"
-  [ -n "$CTX_PCT" ] && CTX_INFO=" (context: ${CTX_PCT}%)"
+  TRANSCRIPT="$(printf '%s' "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)"
+  if [ -n "$TRANSCRIPT" ] && [ -r "$TRANSCRIPT" ]; then
+    SIZE_BYTES="$(stat -c%s "$TRANSCRIPT" 2>/dev/null || stat -f%z "$TRANSCRIPT" 2>/dev/null)"
+    if [ -n "$SIZE_BYTES" ]; then
+      SIZE_MB="$(echo "scale=1; $SIZE_BYTES / 1048576" | bc 2>/dev/null || echo "")"
+      [ -n "$SIZE_MB" ] && CTX_INFO=" (${SIZE_MB}MB)"
+    fi
+  fi
 fi
 
 MSG="🔄 compacting context${CTX_INFO} — older turns are being ${VERB}."
