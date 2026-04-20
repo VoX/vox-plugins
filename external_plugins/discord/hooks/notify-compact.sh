@@ -39,12 +39,19 @@ log "parsed trigger=${TRIGGER:-<empty>}"
 [ "$TRIGGER" = "manual" ] && { log "skip: trigger=manual"; exit 0; }
 
 STATE_DIR="${DISCORD_STATE_DIR:-$CLAUDE_HOME/channels/discord}"
-LAST_CHAT_FILE="$STATE_DIR/sessions/default/last_chat_id.txt"
 
-[ -r "$LAST_CHAT_FILE" ] || { log "skip: no last_chat_id file at $LAST_CHAT_FILE"; exit 0; }
-CHAT_ID="$(cat "$LAST_CHAT_FILE" 2>/dev/null)"
-[ -n "$CHAT_ID" ] || { log "skip: empty chat_id"; exit 0; }
-log "resolved chat_id=$CHAT_ID from $LAST_CHAT_FILE"
+# Derive chat_id from transcript: find the last Discord message in the session
+TRANSCRIPT=""
+if command -v jq >/dev/null 2>&1; then
+  TRANSCRIPT="$(printf '%s' "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)"
+fi
+[ -n "$TRANSCRIPT" ] && [ -r "$TRANSCRIPT" ] || { log "skip: no transcript at ${TRANSCRIPT:-<empty>}"; exit 0; }
+
+CHAT_ID="$(tac "$TRANSCRIPT" 2>/dev/null \
+  | grep -m1 'source="plugin:discord:discord" chat_id="' \
+  | grep -oP 'chat_id="\K[0-9]+')"
+[ -n "$CHAT_ID" ] || { log "skip: no Discord chat_id found in transcript"; exit 0; }
+log "resolved chat_id=$CHAT_ID from transcript"
 
 ENV_FILE="$STATE_DIR/.env"
 [ -r "$ENV_FILE" ] || { log "skip: no .env at $ENV_FILE"; exit 0; }

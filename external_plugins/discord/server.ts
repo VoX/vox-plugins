@@ -183,19 +183,6 @@ try {
   }
 } catch {}
 
-// Per-claude-session "last channel that pinged us" file. Read by the
-// PreCompact hook so a compaction notification can target the channel
-// the user was actually talking to (avoids spamming silent channels).
-// Single-session only: claude code does not currently pass its
-// session_id to MCP servers via env or the MCP protocol, so we can't
-// partition this file by session. Two concurrent claude sessions on
-// the same user will clobber each other's last-chat pointer; the
-// compact notice will land in whichever session DM'd the bot most
-// recently. When anthropic exposes a session_id, swap 'default' out
-// for it here and in hooks/notify-compact.sh.
-const SESSIONS_DIR = join(STATE_DIR, 'sessions')
-const LAST_CHAT_FILE = join(SESSIONS_DIR, 'default', 'last_chat_id.txt')
-
 // --- /dunk + /dedunk state ---
 // Per-channel "stop forwarding messages to claude" state. Persists
 // across plugin restarts so a dunk survives a service restart and the
@@ -1728,16 +1715,6 @@ async function handleInbound(msg: Message): Promise<void> {
     if (!(dunkEntry.allow_mentions && mentionTag && msg.content.includes(mentionTag))) return
   }
 
-  // Record this as the most recent channel so the PreCompact hook has a
-  // target for the "compacting" notice. See comment on LAST_CHAT_FILE —
-  // single-session only; concurrent claude sessions will clobber each
-  // other. Best-effort: a write failure here must not block delivery.
-  try {
-    mkdirSync(join(SESSIONS_DIR, 'default'), { recursive: true, mode: 0o700 })
-    writeFileSync(LAST_CHAT_FILE, chat_id, { mode: 0o600 })
-  } catch (e) {
-    process.stderr.write(`discord: last_chat_id write failed: ${e}\n`)
-  }
 
   // Permission-reply intercept: if this looks like "yes xxxxx" for a
   // pending permission request, emit the structured event instead of
