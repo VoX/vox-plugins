@@ -1844,12 +1844,12 @@ async function syncSlashCommands(appId: string): Promise<void> {
       return
     }
     const current = await res.json() as Array<{ name: string; description: string; type: number; options?: unknown[] }>
-    // Cheap diff — only check name/description/options shape. Discord
+    // Deep diff — compare names, descriptions, and options. Discord
     // PUT bulk-overwrites idempotently, but skipping the call when the
     // set is already aligned saves an API hit per restart.
-    const wantNames = new Set(SLASH_COMMANDS.map(c => c.name))
-    const haveNames = new Set(current.map(c => c.name))
-    const aligned = wantNames.size === haveNames.size && [...wantNames].every(n => haveNames.has(n))
+    const normalize = (cmds: Array<{ name: string; description?: string; options?: unknown[] }>) =>
+      JSON.stringify(cmds.map(c => ({ name: c.name, description: c.description, options: c.options || [] })).sort((a, b) => a.name.localeCompare(b.name)))
+    const aligned = normalize(SLASH_COMMANDS) === normalize(current)
     if (aligned) {
       process.stderr.write(`discord: slash commands already aligned (${[...wantNames].join(', ')})\n`)
       return
