@@ -85,9 +85,7 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
 
 **`replyToMode`** controls threading on chunked replies. When a long response is split, `first` (default) threads only the first chunk under the inbound message; `all` threads every chunk; `off` sends all chunks standalone.
 
-**`textChunkLimit`** sets the split threshold. Discord rejects messages over 2000 characters, which is the hard ceiling.
-
-**`chunkMode`** chooses the split strategy: `length` cuts exactly at the limit; `newline` prefers paragraph boundaries.
+**`textChunkLimit`** sets the split threshold. Discord rejects messages over 2000 characters, which is the hard ceiling. Long replies always split at the latest whitespace boundary under the limit (paragraph → line → space → hard cut) so `<@userid>` mentions, URLs, and code fences stay intact across chunks.
 
 ## Skill reference
 
@@ -101,7 +99,7 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
 | `/discord:access policy allowlist` | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`. |
 | `/discord:access group add 846209781206941736` | Enable a guild channel. Flags: `--no-mention`, `--allow id1,id2`. |
 | `/discord:access group rm 846209781206941736` | Disable a guild channel. |
-| `/discord:access set ackReaction 🔨` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`. |
+| `/discord:access set ackReaction 🔨` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `mentionPatterns`. |
 
 ## Config file
 
@@ -134,10 +132,9 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
   // Threading on chunked replies: first | all | off
   "replyToMode": "first",
 
-  // Split threshold. Discord rejects > 2000.
-  "textChunkLimit": 2000,
-
-  // length = cut at limit. newline = prefer paragraph boundaries.
-  "chunkMode": "newline"
+  // Split threshold. Discord rejects > 2000. Long replies always split
+  // at the latest whitespace boundary under the limit to keep mentions,
+  // URLs, and code fences intact across chunks.
+  "textChunkLimit": 2000
 }
 ```

@@ -323,8 +323,6 @@ type Access = {
   replyToMode?: 'off' | 'first' | 'all'
   /** Max chars per outbound message before splitting. Default: 2000 (Discord's hard cap). */
   textChunkLimit?: number
-  /** Split on paragraph boundaries instead of hard char count. */
-  chunkMode?: 'length' | 'newline'
 }
 
 function defaultAccess(): Access {
@@ -614,25 +612,22 @@ function checkApprovals(): void {
 if (!STATIC) setInterval(checkApprovals, 5000).unref()
 
 // Discord caps messages at 2000 chars (hard limit — larger sends reject).
-// Split long replies, preferring paragraph boundaries when chunkMode is
-// 'newline'.
-
-function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[] {
+// When a reply exceeds the limit, split at the latest whitespace boundary
+// that fits under it rather than hard-cutting mid-token. Preference order:
+// paragraph (\n\n) → line (\n) → space → hard cut (only for pathological
+// strings with no whitespace in 2000+ chars). Keeping the whole @mention,
+// URL, or code fence together matters more than balancing chunk size.
+function chunk(text: string, limit: number): string[] {
   if (text.length <= limit) return [text]
   const out: string[] = []
   let rest = text
   while (rest.length > limit) {
-    let cut = limit
-    if (mode === 'newline') {
-      // Prefer the last double-newline (paragraph), then single newline,
-      // then space. Fall back to hard cut.
-      const para = rest.lastIndexOf('\n\n', limit)
-      const line = rest.lastIndexOf('\n', limit)
-      const space = rest.lastIndexOf(' ', limit)
-      cut = para > limit / 2 ? para : line > limit / 2 ? line : space > 0 ? space : limit
-    }
+    const para = rest.lastIndexOf('\n\n', limit)
+    const line = rest.lastIndexOf('\n', limit)
+    const space = rest.lastIndexOf(' ', limit)
+    const cut = para > 0 ? para : line > 0 ? line : space > 0 ? space : limit
     out.push(rest.slice(0, cut))
-    rest = rest.slice(cut).replace(/^\n+/, '')
+    rest = rest.slice(cut).replace(/^\s+/, '')
   }
   if (rest) out.push(rest)
   return out
@@ -1006,9 +1001,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         const access = loadAccess()
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
-        const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
+        const chunks = chunk(text, limit)
         const sentIds: string[] = []
 
         try {
