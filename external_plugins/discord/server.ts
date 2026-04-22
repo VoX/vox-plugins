@@ -26,9 +26,11 @@ import {
   ButtonStyle,
   ActionRowBuilder,
   MessageFlags,
+  Status,
   type Message,
   type Attachment,
   type Interaction,
+  type CloseEvent,
 } from 'discord.js'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, copyFileSync, unlinkSync } from 'fs'
@@ -1217,9 +1219,66 @@ process.stdin.on('close', shutdown)
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
+// Gateway lifecycle hardening. The discord.js websocket can drop silently
+// (dead TCP, CloudFront edge flap, etc.) and leave the process alive but
+// deaf. We log + exit on terminal signals so systemd's Restart=always
+// recycles us. See plugin.json 0.2.18 for context.
+function terminalExit(reason: string, code = 1): never {
+  process.stderr.write(`discord channel: ${reason} — exiting ${code}\n`)
+  process.exit(code)
+}
+
 client.on('error', err => {
-  process.stderr.write(`discord channel: client error: ${err}\n`)
+  const msg = err instanceof Error ? err.message : String(err)
+  process.stderr.write(`discord channel: client error: ${msg}\n`)
+  // Exit on errors that won't recover in-process (abort, terminal close codes).
+  if (/\bAbortError\b/.test(msg) || /\bCLOSE_/.test(msg)) {
+    terminalExit(`terminal client error: ${msg}`)
+  }
 })
+
+client.on('shardDisconnect', (event: CloseEvent, shardId: number) => {
+  terminalExit(`shard ${shardId} disconnected (code=${event.code})`)
+})
+
+client.on('shardError', (err: Error, shardId: number) => {
+  // Transient per-shard errors are noisy — log only. shardDisconnect /
+  // watchdog will kill the process if the socket actually stays down.
+  process.stderr.write(`discord channel: shard ${shardId} error: ${err.message}\n`)
+})
+
+client.on('invalidated', () => {
+  terminalExit('session invalidated')
+})
+
+// Watchdog: poll ws status every 30s. If it's not READY for 3 consecutive
+// checks (~90s of continuous non-ready) kill the process so systemd can
+// restart us. Any inbound message resets the counter — a transient
+// reconnect that still routes traffic shouldn't trip this.
+const WATCHDOG_INTERVAL_MS = 30_000
+const WATCHDOG_MAX_MISSES = 3
+let watchdogMisses = 0
+let watchdogStarted = false
+function startWatchdog(): void {
+  if (watchdogStarted) return
+  watchdogStarted = true
+  const timer = setInterval(() => {
+    if (client.ws.status === Status.Ready) {
+      watchdogMisses = 0
+      return
+    }
+    watchdogMisses++
+    process.stderr.write(
+      `discord channel: watchdog miss ${watchdogMisses}/${WATCHDOG_MAX_MISSES} (ws.status=${client.ws.status})\n`,
+    )
+    if (watchdogMisses >= WATCHDOG_MAX_MISSES) {
+      clearInterval(timer)
+      terminalExit(`watchdog: ws not ready for ${WATCHDOG_MAX_MISSES} checks`)
+    }
+  }, WATCHDOG_INTERVAL_MS)
+  // Don't keep the event loop alive solely for the watchdog.
+  if (typeof timer.unref === 'function') timer.unref()
+}
 
 // --- /status slash command ---
 // Reads the most recently active claude session transcript, summarizes
@@ -1664,6 +1723,9 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 })
 
 client.on('messageCreate', msg => {
+  // Live traffic resets the watchdog — if we got a message, the socket
+  // clearly routed it, regardless of what ws.status happens to show.
+  watchdogMisses = 0
   // Skip our own messages to avoid loops, but allow other bots through.
   if (msg.author.id === client.user?.id) return
   // Populate username cache from every message we see (even ones we won't deliver).
@@ -1842,6 +1904,7 @@ async function syncSlashCommands(appId: string): Promise<void> {
 
 client.once('ready', c => {
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
+  startWatchdog()
   void syncSlashCommands(c.user.id)
 })
 

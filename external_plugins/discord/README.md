@@ -160,3 +160,8 @@ same `sessions/default/last_chat_id.txt`, and the compaction ping will
 land wherever the most-recent Discord message happened to arrive —
 which may not be the session that actually compacted. Safe for the
 usual one-session-per-user setup; broken for multi-session-on-one-user.
+
+## Changelog
+
+### 0.2.18
+- Harden gateway lifecycle: exit on `shardDisconnect` / `invalidated` / terminal `error`, log-only for `shardError`, plus a 30s-interval watchdog that exits after 3 consecutive non-READY `client.ws.status` checks (resets on inbound messages) so systemd restarts a silently dead socket.
