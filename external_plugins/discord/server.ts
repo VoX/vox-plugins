@@ -36,6 +36,7 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, copyFileSync, unlinkSync } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
+import sharp from 'sharp'
 
 // Opt-in gate. Plugin is inert unless VOX_PLUGINS_ENABLED=1 is set in the
 // environment (only our systemd service sets it). Fresh claude CLI sessions
@@ -338,6 +339,14 @@ function defaultAccess(): Access {
 
 const MAX_CHUNK_LIMIT = 2000
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+
+// Claude's vision API rejects images >2000px on either edge and >5MB. Stay
+// well under both: 1600px long edge gives headroom and matches the model's
+// internal downsample target (~1568px), so re-encoding here is essentially
+// free in fidelity. Without this, a single oversized screenshot lands in the
+// session jsonl and poisons every subsequent reply on resume.
+const MAX_IMAGE_LONG_EDGE = 1600
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
 // reply's files param takes any path. .env is ~60 bytes and ships as an
 // upload. Claude can already Read+paste file contents, so this isn't a new
@@ -670,16 +679,54 @@ async function downloadAttachment(att: Attachment): Promise<string> {
   if (!res.ok) {
     throw new Error(`attachment fetch failed: ${res.status} ${res.statusText} (${att.url})`)
   }
-  const buf = Buffer.from(await res.arrayBuffer())
+  let buf = Buffer.from(await res.arrayBuffer())
   if (buf.length > MAX_ATTACHMENT_BYTES) {
     throw new Error(`attachment body too large: ${(buf.length / 1024 / 1024).toFixed(1)}MB, max ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB`)
   }
+  buf = await maybeDownscaleImage(buf, att.contentType)
   const name = att.name ?? `${att.id}`
   const rawExt = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : 'bin'
   const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
   const path = join(INBOX_DIR, `${Date.now()}-${att.id}.${ext}`)
   writeFileSync(path, buf)
   return path
+}
+
+// Resize still images to fit Claude's vision limits before they hit disk —
+// the path written here ends up in the session jsonl, and on resume the SDK
+// re-reads any image at that path. An oversized image at re-read time
+// returns a 400 that poisons every subsequent turn until the jsonl is
+// surgically edited. Animated images (GIF/WEBP/AVIF with pages > 1) pass
+// through unchanged: sharp would only resize the first frame.
+async function maybeDownscaleImage(buf: Buffer, contentType: string | null): Promise<Buffer> {
+  if (!contentType?.startsWith('image/')) return buf
+  let pipeline: sharp.Sharp
+  let meta: sharp.Metadata
+  try {
+    pipeline = sharp(buf, { animated: true })
+    meta = await pipeline.metadata()
+  } catch {
+    return buf
+  }
+  if ((meta.pages ?? 1) > 1) return buf
+  const longEdge = Math.max(meta.width ?? 0, meta.height ?? 0)
+  const needsResize = longEdge > MAX_IMAGE_LONG_EDGE
+  const needsReencode = buf.length > MAX_IMAGE_BYTES
+  if (!needsResize && !needsReencode) return buf
+  if (needsResize) {
+    pipeline = pipeline.resize({
+      width: MAX_IMAGE_LONG_EDGE,
+      height: MAX_IMAGE_LONG_EDGE,
+      fit: 'inside',
+      kernel: 'lanczos3',
+      withoutEnlargement: true,
+    })
+  }
+  try {
+    return await pipeline.toBuffer()
+  } catch {
+    return buf
+  }
 }
 
 // att.name is uploader-controlled. It lands inside a [...] annotation in the
