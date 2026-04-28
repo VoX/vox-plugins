@@ -72,6 +72,10 @@ type Job = {
   delivery_failures?: number
   on_startup?: boolean
   persistent_startup?: boolean
+  // Optional structured context blob attached to the wake-up notification's
+  // meta. Lets callers pass concrete data ({pr_id: 62, action: "verify"})
+  // instead of jamming everything into the prose `text` field.
+  payload?: unknown
 }
 
 const MAX_REARM_RETRIES = 3
@@ -114,6 +118,10 @@ function saveJobs(store: JobStore): void {
 
 function newId(): string {
   return 'sched_' + randomBytes(6).toString('hex')
+}
+
+function truncate(s: string, max: number): string {
+  return s.length > max ? s.slice(0, max - 1) + '…' : s
 }
 
 // Cached probe: is `systemd-analyze` on PATH? Runs lazily on first use so
@@ -240,6 +248,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             description: 'Optional cap on total fires for a recurring job. Job auto-deletes when reached. Ignored for one-shot `at` and `on_startup` jobs.',
           },
           title: { type: 'string', description: 'Optional short label shown in list_scheduled output.' },
+          payload: {
+            // Schema deliberately omits `type` — payload accepts any JSON value
+            // (object, array, primitive). Runtime serializability check happens
+            // in the schedule handler.
+            description: 'Optional structured context for future-self. Any JSON value (object, array, primitive). Available on the wake-up notification as a meta.payload attribute. Use this for concrete data ({"pr_id": 62, "action": "verify"}) instead of cramming it into the `text` prose.',
+          },
         },
         required: ['text'],
       },
@@ -279,6 +293,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     const max = typeof args.max_executions === 'number' && args.max_executions > 0
       ? Math.floor(args.max_executions)
       : undefined
+    // Round-trip through JSON so we reject anything non-serializable (functions,
+    // bigints, circular refs) at schedule-time rather than at fire-time.
+    let payload: unknown
+    if (args.payload !== undefined) {
+      try {
+        payload = JSON.parse(JSON.stringify(args.payload))
+      } catch (e) {
+        throw new Error(`payload is not JSON-serializable: ${e instanceof Error ? e.message : String(e)}`)
+      }
+    }
 
     let fire_at: number
     if (at) {
@@ -313,6 +337,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       ...(calendar && max ? { max_executions: max } : {}),
       ...(on_startup ? { on_startup: true } : {}),
       ...(persistent_startup ? { persistent_startup: true } : {}),
+      ...(payload !== undefined ? { payload } : {}),
     }
     await withJobMutex(async () => {
       const store = loadJobs()
@@ -350,8 +375,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         : ''
       const count = ` fired=${j.execution_count}`
       const ttl = j.title ? ` ${j.title}` : ''
-      const preview = j.text.length > 80 ? j.text.slice(0, 77) + '…' : j.text
-      return `${j.id}  ${when}${rec}${rem}${count}${ttl}\n  ${preview}`
+      const preview = truncate(j.text, 80)
+      const pl = j.payload !== undefined
+        ? `\n  payload: ${truncate(JSON.stringify(j.payload), 120)}`
+        : ''
+      return `${j.id}  ${when}${rec}${rem}${count}${ttl}\n  ${preview}${pl}`
     })
     return { content: [{ type: 'text', text: lines.join('\n') }] }
   }
@@ -410,6 +438,7 @@ async function tick(): Promise<void> {
           if (job.max_executions !== undefined) {
             meta.remaining_after = String(job.max_executions - (job.execution_count + 1))
           }
+          if (job.payload !== undefined) meta.payload = JSON.stringify(job.payload)
           dbg(`tick fire ${job.id}: content=${JSON.stringify(job.text).slice(0, 100)} meta=${JSON.stringify(meta)}`)
           return mcp.notification({
             method: 'notifications/claude/channel',
