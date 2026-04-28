@@ -806,7 +806,7 @@ async function openSendable(chatId: string) {
 // the API accepts them and `setURL` (title link) is not proxied.
 function assertEmbedUrl(field: string, value: string): void {
   if (!/^https?:\/\//i.test(value)) {
-    throw new Error(`${field} must be an http(s) URL (got: ${safeSlice(value, 80)})`)
+    throw new Error(`${field} must be an http(s) URL (got: ${JSON.stringify(safeSlice(value, 80))})`)
   }
 }
 
@@ -1352,7 +1352,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const memberships = await Promise.allSettled(
           guilds.map(async guild => ({ guild, member: await guild.members.fetch(user_id) })),
         )
+        // Separate counters for shared-guild rows vs non-10007 errors so the
+        // index numbers don't lie about position. `guild[N]` always means
+        // "Nth confirmed shared guild"; `guild_error[M]` is the Mth non-
+        // suppressed error (rate limit, missing access, etc.). Suppressed
+        // 10007 ("Unknown Member") rows are silent — the expected miss.
         let shared = 0
+        let errIdx = 0
         for (let i = 0; i < memberships.length; i++) {
           const result = memberships[i]
           const guild = guilds[i]
@@ -1371,11 +1377,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             const err = result.reason
             if (err instanceof DiscordAPIError && err.code === 10007) continue
             const msg = err instanceof Error ? err.message : String(err)
-            lines.push(`guild[${shared}] id=${guild.id} name=${JSON.stringify(guild.name)} error=${JSON.stringify(msg)}`)
-            shared++
+            lines.push(`guild_error[${errIdx}] id=${guild.id} name=${JSON.stringify(guild.name)} error=${JSON.stringify(msg)}`)
+            errIdx++
           }
         }
-        if (shared === 0) lines.push('(user is not a member of any guild this bot is in)')
+        if (shared === 0 && errIdx === 0) lines.push('(user is not a member of any guild this bot is in)')
         return { content: [{ type: 'text', text: lines.join('\n') }] }
       }
       case 'fetch_messages': {
@@ -1477,15 +1483,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const filePath = args.file as string
         const replyTo = args.reply_to as string | undefined
 
-        stopTyping(chatId)
+        const ch = await openSendable(chatId)
         assertSendable(filePath)
         const st = statSync(filePath)
         if (st.size > MAX_ATTACHMENT_BYTES) {
           throw new Error(`file too large: ${filePath} (${(st.size / 1024 / 1024).toFixed(1)}MB, max 25MB)`)
         }
-
-        const ch = await fetchAllowedChannel(chatId)
-        if (!('send' in ch)) throw new Error('channel is not sendable')
 
         // Read raw audio bytes and compute a simple waveform (256 samples, RMS amplitude per chunk)
         const audioBuf = readFileSync(filePath)
