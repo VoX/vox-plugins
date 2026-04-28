@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { safeSlice, formatSendResult, assertEmbedUrl, chunk } from './lib'
+import { safeSlice, formatSendResult, assertEmbedUrl, chunk, buildEmbedFromArgs } from './lib'
 
 describe('safeSlice', () => {
   test('returns input unchanged when shorter than limit', () => {
@@ -115,6 +115,75 @@ describe('assertEmbedUrl', () => {
   test('error message includes the field name', () => {
     expect(() => assertEmbedUrl('thumbnail_url', 'bad'))
       .toThrow(/^thumbnail_url /)
+  })
+})
+
+describe('buildEmbedFromArgs', () => {
+  test('empty args returns empty embed (no throw)', () => {
+    expect(() => buildEmbedFromArgs({})).not.toThrow()
+  })
+
+  test('basic embed sets fields via discord.js EmbedBuilder', () => {
+    const e = buildEmbedFromArgs({ title: 'hi', description: 'body' })
+    const json = e.toJSON()
+    expect(json.title).toBe('hi')
+    expect(json.description).toBe('body')
+  })
+
+  test('rejects javascript: url', () => {
+    expect(() => buildEmbedFromArgs({ url: 'javascript:alert(1)' }))
+      .toThrow(/url must be an http\(s\) URL/)
+  })
+
+  test('rejects javascript: thumbnail_url', () => {
+    expect(() => buildEmbedFromArgs({ thumbnail_url: 'javascript:alert(1)' }))
+      .toThrow(/thumbnail_url must be an http\(s\) URL/)
+  })
+
+  test('rejects more than 25 fields', () => {
+    const fields = Array.from({ length: 26 }, (_, i) => ({ name: `f${i}`, value: `v${i}` }))
+    expect(() => buildEmbedFromArgs({ fields }))
+      .toThrow(/max 25 embed fields \(got 26\)/)
+  })
+
+  test('rejects field missing name or value', () => {
+    expect(() => buildEmbedFromArgs({ fields: [{ name: 'ok', value: 'ok' }, { name: 'bad' }] }))
+      .toThrow(/field\[1\] missing name or value/)
+  })
+
+  test('rejects invalid color', () => {
+    expect(() => buildEmbedFromArgs({ color: 'not-a-color' }))
+      .toThrow(/invalid color/)
+  })
+
+  test('accepts named color (case-insensitive)', () => {
+    expect(() => buildEmbedFromArgs({ color: 'blurple' })).not.toThrow()
+    expect(() => buildEmbedFromArgs({ color: 'BLURPLE' })).not.toThrow()
+    expect(() => buildEmbedFromArgs({ color: 'Blurple' })).not.toThrow()
+  })
+
+  test('accepts hex color with and without hash', () => {
+    expect(() => buildEmbedFromArgs({ color: '#5865f2' })).not.toThrow()
+    expect(() => buildEmbedFromArgs({ color: '5865f2' })).not.toThrow()
+  })
+
+  test('rejects invalid timestamp', () => {
+    expect(() => buildEmbedFromArgs({ timestamp: 'not-a-date' }))
+      .toThrow(/invalid timestamp/)
+  })
+
+  test('accepts timestamp:true (now)', () => {
+    expect(() => buildEmbedFromArgs({ timestamp: true })).not.toThrow()
+  })
+
+  test('accepts ISO-8601 timestamp', () => {
+    expect(() => buildEmbedFromArgs({ timestamp: '2026-04-28T00:00:00Z' })).not.toThrow()
+  })
+
+  test('truncates oversized title via safeSlice', () => {
+    const longTitle = 'x'.repeat(1000)
+    const e = buildEmbedFromArgs({ title: longTitle })
+    expect(e.toJSON().title!.length).toBe(256)
   })
 })
 
