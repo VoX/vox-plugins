@@ -76,6 +76,10 @@ type Job = {
   // meta. Lets callers pass concrete data ({pr_id: 62, action: "verify"})
   // instead of jamming everything into the prose `text` field.
   payload?: unknown
+  // Optional grouping tag for `list_scheduled` filtering. Long cron
+  // sessions accumulate dozens of jobs; tagging them lets the caller
+  // pull just the ones related to a specific topic (e.g. "babysit-pr").
+  tag?: string
 }
 
 const MAX_REARM_RETRIES = 3
@@ -122,6 +126,11 @@ function newId(): string {
 
 function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max - 1) + '…' : s
+}
+
+function optString(args: Record<string, unknown>, key: string): string | undefined {
+  const v = args[key]
+  return typeof v === 'string' && v.trim() ? v.trim() : undefined
 }
 
 // Cached probe: is `systemd-analyze` on PATH? Runs lazily on first use so
@@ -254,14 +263,24 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             // in the schedule handler.
             description: 'Optional structured context for future-self. Any JSON value (object, array, primitive). Available on the wake-up notification as a meta.payload attribute. Use this for concrete data ({"pr_id": 62, "action": "verify"}) instead of cramming it into the `text` prose.',
           },
+          tag: {
+            type: 'string',
+            description: 'Optional grouping tag for filtering with list_scheduled (e.g. "babysit-pr", "cron-fanout"). Multiple jobs can share a tag.',
+          },
         },
         required: ['text'],
       },
     },
     {
       name: 'list_scheduled',
-      description: 'List all pending scheduled jobs, sorted by next fire time.',
-      inputSchema: { type: 'object', properties: {} },
+      description: 'List pending scheduled jobs, sorted by next fire time. Filter by `title_prefix` and/or `tag` to narrow the result in long cron sessions. Use `tag` for explicit groups you set at schedule-time; use `title_prefix` for fuzzy lookup of jobs you didn\'t pre-tag.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          title_prefix: { type: 'string', description: 'Only show jobs whose title starts with this prefix (case-insensitive).' },
+          tag: { type: 'string', description: 'Only show jobs with this exact tag (case-sensitive — matches what was passed to schedule()).' },
+        },
+      },
     },
     {
       name: 'cancel',
@@ -282,14 +301,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   if (name === 'schedule') {
     const text = String(args.text ?? '').trim()
     if (!text) throw new Error('text is required')
-    const at = typeof args.at === 'string' && args.at.trim() ? args.at.trim() : undefined
-    const calendar = typeof args.calendar === 'string' && args.calendar.trim() ? args.calendar.trim() : undefined
+    const at = optString(args, 'at')
+    const calendar = optString(args, 'calendar')
     const on_startup = args.on_startup === true
     const persistent_startup = args.persistent_startup === true
     const picked = [at && 'at', calendar && 'calendar', on_startup && 'on_startup', persistent_startup && 'persistent_startup'].filter(Boolean)
     if (picked.length === 0) throw new Error('provide at (one-shot ISO-8601), calendar (systemd calendar expression), on_startup (fire on next server startup), or persistent_startup (fire on every server startup)')
     if (picked.length > 1) throw new Error(`provide only one of at, calendar, on_startup, or persistent_startup (got ${picked.join(', ')})`)
-    const title = typeof args.title === 'string' && args.title.trim() ? args.title.trim() : undefined
+    const title = optString(args, 'title')
+    const tag = optString(args, 'tag')
+    if (tag && tag.length > 128) throw new Error(`tag too long (${tag.length} chars, max 128)`)
     const max = typeof args.max_executions === 'number' && args.max_executions > 0
       ? Math.floor(args.max_executions)
       : undefined
@@ -338,6 +359,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       ...(on_startup ? { on_startup: true } : {}),
       ...(persistent_startup ? { persistent_startup: true } : {}),
       ...(payload !== undefined ? { payload } : {}),
+      ...(tag ? { tag } : {}),
     }
     await withJobMutex(async () => {
       const store = loadJobs()
@@ -354,15 +376,31 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       if (max) lines.push(`max_executions: ${max}`)
     }
     if (title) lines.push(`title: ${title}`)
+    if (tag) lines.push(`tag: ${tag}`)
     return { content: [{ type: 'text', text: lines.join('\n') }] }
   }
 
   if (name === 'list_scheduled') {
+    const titlePrefix = optString(args, 'title_prefix')?.toLowerCase()
+    const tagFilter = optString(args, 'tag')
+
     const store = loadJobs()
-    if (store.jobs.length === 0) return { content: [{ type: 'text', text: 'no scheduled jobs' }] }
+    let jobs = store.jobs
+    if (titlePrefix) {
+      jobs = jobs.filter(j => (j.title ?? '').toLowerCase().startsWith(titlePrefix))
+    }
+    if (tagFilter) {
+      jobs = jobs.filter(j => j.tag === tagFilter)
+    }
+    if (jobs.length === 0) {
+      const msg = titlePrefix || tagFilter
+        ? `no scheduled jobs match (title_prefix=${titlePrefix ?? '∅'} tag=${tagFilter ?? '∅'})`
+        : 'no scheduled jobs'
+      return { content: [{ type: 'text', text: msg }] }
+    }
     // Startup jobs carry fire_at=0, so a plain numeric sort naturally
     // floats them to the top above scheduled work.
-    const sorted = [...store.jobs].sort((a, b) => a.fire_at - b.fire_at)
+    const sorted = [...jobs].sort((a, b) => a.fire_at - b.fire_at)
     const lines = sorted.map(j => {
       const when = j.persistent_startup
         ? 'every startup'
@@ -375,11 +413,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         : ''
       const count = ` fired=${j.execution_count}`
       const ttl = j.title ? ` ${j.title}` : ''
+      const tg = j.tag ? ` #${j.tag}` : ''
       const preview = truncate(j.text, 80)
       const pl = j.payload !== undefined
         ? `\n  payload: ${truncate(JSON.stringify(j.payload), 120)}`
         : ''
-      return `${j.id}  ${when}${rec}${rem}${count}${ttl}\n  ${preview}${pl}`
+      return `${j.id}  ${when}${rec}${rem}${count}${ttl}${tg}\n  ${preview}${pl}`
     })
     return { content: [{ type: 'text', text: lines.join('\n') }] }
   }
