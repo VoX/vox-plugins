@@ -28,6 +28,7 @@ import {
   EmbedBuilder,
   MessageFlags,
   Status,
+  DiscordAPIError,
   resolveColor,
   type Message,
   type Attachment,
@@ -960,6 +961,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'get_user_info',
+      description: 'Look up a Discord user by ID. Returns username, display name, avatar URL, bot flag, and — for each guild the bot shares with the user — nickname + role names. Use to identify a user_id from an inbound channel tag you don\'t recognize, or to enrich context before replying.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          user_id: { type: 'string', description: 'Discord user ID (snowflake).' },
+        },
+        required: ['user_id'],
+      },
+    },
+    {
       name: 'react',
       description: 'Add an emoji reaction to a Discord message. Unicode emoji work directly; custom emoji need the <:name:id> form.',
       inputSchema: {
@@ -1195,6 +1207,46 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         })
         noteSent(sent.id)
         return { content: [{ type: 'text', text: `sent embed (id: ${sent.id})` }] }
+      }
+      case 'get_user_info': {
+        const user_id = args.user_id as string
+        const user = await client.users.fetch(user_id)
+        const lines: string[] = []
+        lines.push(`id=${user.id}`)
+        lines.push(`username=${user.username}`)
+        if (user.globalName) lines.push(`global_name=${user.globalName}`)
+        lines.push(`avatar=${user.displayAvatarURL({ size: 256 })}`)
+        lines.push(`bot=${user.bot}`)
+        // Parallel guild fetch — bot may be in many servers and most lookups
+        // miss. Catch ONLY `Unknown Member` (10007); rate limits / permission
+        // errors / network failures must surface or callers see a false "user
+        // is in no guilds" result that masks real problems.
+        const guilds = [...client.guilds.cache.values()]
+        const memberships = await Promise.all(
+          guilds.map(async guild => {
+            try {
+              return { guild, member: await guild.members.fetch(user_id) }
+            } catch (err) {
+              if (err instanceof DiscordAPIError && err.code === 10007) return null
+              throw err
+            }
+          }),
+        )
+        let shared = 0
+        for (const m of memberships) {
+          if (!m) continue
+          const roles = m.member.roles.cache
+            .filter(r => r.name !== '@everyone')
+            .map(r => r.name)
+            .sort()
+            .join(', ')
+          const display = ` display_name=${JSON.stringify(m.member.displayName)}`
+          const nick = m.member.nickname ? ` nick=${JSON.stringify(m.member.nickname)}` : ''
+          lines.push(`guild[${shared}] id=${m.guild.id} name=${JSON.stringify(m.guild.name)}${display}${nick} roles=${JSON.stringify(roles)}`)
+          shared++
+        }
+        if (shared === 0) lines.push('(user is not a member of any guild this bot is in)')
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
       }
       case 'fetch_messages': {
         const ch = await fetchAllowedChannel(args.channel as string)
