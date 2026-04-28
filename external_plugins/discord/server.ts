@@ -344,6 +344,12 @@ function defaultAccess(): Access {
 const MAX_CHUNK_LIMIT = 2000
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 
+// Sanity cap for `bulk_reply` fanout. Not a Discord limit — Discord's per-bucket
+// rate limit is keyed by channel so parallel sends to N distinct channels share
+// no rate-limit pressure. The cap exists to prevent a single tool call from
+// accidentally fanning out to the entire allowlist.
+const BULK_REPLY_MAX_CHANNELS = 20
+
 // Claude's vision API rejects images >2000px on either edge and >5MB. Stay
 // well under both: 1600px long edge gives headroom and matches the model's
 // internal downsample target (~1568px), so re-encoding here is essentially
@@ -749,6 +755,12 @@ function safeAttName(att: Attachment): string {
 // integrity. (Doesn't handle ZWJ-glued sequences like 👨‍👩‍👧‍👦 as a
 // single grapheme — those split into component emoji — but no encoding
 // error, just a visual artifact in a 200-char snippet preview.)
+function formatSendResult(ids: string[]): string {
+  return ids.length === 1
+    ? `sent (id: ${ids[0]})`
+    : `sent ${ids.length} parts (ids: ${ids.join(', ')})`
+}
+
 function safeSlice(str: string, n: number): string {
   // Fast path: most strings (titles, footers, single-line snippets) are
   // already under the cap, so skip the codepoint walk entirely.
@@ -961,6 +973,22 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'bulk_reply',
+      description: 'Send the same plain-text message to multiple Discord channels in one tool call. Sends in parallel; one channel\'s failure does not block the others. Returns a per-channel result. Use for cron-style fan-out status updates. For embeds use one `send_embed` per channel; for replies-with-attachments use `reply` per channel.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_ids: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'List of Discord channel IDs to send to. Each must be allowlisted. Max 20 per call.',
+          },
+          text: { type: 'string' },
+        },
+        required: ['chat_ids', 'text'],
+      },
+    },
+    {
       name: 'get_user_info',
       description: 'Look up a Discord user by ID. Returns username, display name, avatar URL, bot flag, and — for each guild the bot shares with the user — nickname + role names. Use to identify a user_id from an inbound channel tag you don\'t recognize, or to enrich context before replying.',
       inputSchema: {
@@ -1139,11 +1167,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           throw new Error(`reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`)
         }
 
-        const result =
-          sentIds.length === 1
-            ? `sent (id: ${sentIds[0]})`
-            : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
-        return { content: [{ type: 'text', text: result }] }
+        return { content: [{ type: 'text', text: formatSendResult(sentIds) }] }
       }
       case 'send_embed': {
         const chat_id = args.chat_id as string
@@ -1207,6 +1231,57 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         })
         noteSent(sent.id)
         return { content: [{ type: 'text', text: `sent embed (id: ${sent.id})` }] }
+      }
+      case 'bulk_reply': {
+        const chat_ids = args.chat_ids as string[]
+        const text = args.text as string
+        if (!Array.isArray(chat_ids) || chat_ids.length === 0) {
+          throw new Error('chat_ids must be a non-empty array')
+        }
+        if (chat_ids.length > BULK_REPLY_MAX_CHANNELS) {
+          throw new Error(`bulk_reply max ${BULK_REPLY_MAX_CHANNELS} channels per call (got ${chat_ids.length})`)
+        }
+        const access = loadAccess()
+        const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
+        const chunks = chunk(text, limit)
+        // Parallel across channels (each channel is its own Discord rate-limit
+        // bucket), serial within a channel (preserve chunk ordering).
+        const results = await Promise.all(
+          chat_ids.map(async chat_id => {
+            const sentIds: string[] = []
+            try {
+              stopTyping(chat_id)
+              const ch = await fetchAllowedChannel(chat_id)
+              if (!('send' in ch)) throw new Error('channel is not sendable')
+              for (const c of chunks) {
+                const sent = await ch.send({ content: c })
+                noteSent(sent.id)
+                sentIds.push(sent.id)
+              }
+              return { chat_id, ok: true as const, ids: sentIds }
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err)
+              return { chat_id, ok: false as const, error: msg, partialIds: sentIds }
+            }
+          }),
+        )
+        const okCount = results.filter(r => r.ok).length
+        const failedIds = results.filter(r => !r.ok).map(r => r.chat_id)
+        const summary = failedIds.length === 0
+          ? `bulk_reply: ${okCount}/${results.length} channels succeeded`
+          : `bulk_reply: ${okCount}/${results.length} channels succeeded (failed: ${failedIds.join(', ')})`
+        const lines = [summary]
+        for (const r of results) {
+          if (r.ok) {
+            lines.push(`  ${r.chat_id}: ${formatSendResult(r.ids)}`)
+          } else {
+            const partial = r.partialIds.length > 0
+              ? ` after ${r.partialIds.length} of ${chunks.length} chunk(s) sent`
+              : ''
+            lines.push(`  ${r.chat_id}: FAILED${partial} — ${r.error}`)
+          }
+        }
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
       }
       case 'get_user_info': {
         const user_id = args.user_id as string
