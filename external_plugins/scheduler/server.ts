@@ -22,6 +22,7 @@ import { homedir } from 'os'
 import { join } from 'path'
 import { randomBytes } from 'crypto'
 import { spawnSync } from 'child_process'
+import { truncate, optString } from './lib'
 
 // Opt-in gate. Plugin is inert unless VOX_PLUGINS_ENABLED=1 is set in the
 // environment (only our systemd service sets it). Fresh claude CLI sessions
@@ -124,14 +125,6 @@ function newId(): string {
   return 'sched_' + randomBytes(6).toString('hex')
 }
 
-function truncate(s: string, max: number): string {
-  return s.length > max ? s.slice(0, max - 1) + '…' : s
-}
-
-function optString(args: Record<string, unknown>, key: string): string | undefined {
-  const v = args[key]
-  return typeof v === 'string' && v.trim() ? v.trim() : undefined
-}
 
 // Cached probe: is `systemd-analyze` on PATH? Runs lazily on first use so
 // macOS / minimal Alpine users get a clean error instead of a confusing
