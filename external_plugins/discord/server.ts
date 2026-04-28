@@ -25,12 +25,15 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ActionRowBuilder,
+  EmbedBuilder,
   MessageFlags,
   Status,
+  resolveColor,
   type Message,
   type Attachment,
   type Interaction,
   type CloseEvent,
+  type ColorResolvable,
 } from 'discord.js'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, copyFileSync, unlinkSync } from 'fs'
@@ -746,6 +749,9 @@ function safeAttName(att: Attachment): string {
 // single grapheme — those split into component emoji — but no encoding
 // error, just a visual artifact in a 200-char snippet preview.)
 function safeSlice(str: string, n: number): string {
+  // Fast path: most strings (titles, footers, single-line snippets) are
+  // already under the cap, so skip the codepoint walk entirely.
+  if (str.length <= n) return str
   return Array.from(str).slice(0, n).join('')
 }
 
@@ -918,6 +924,39 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['chat_id', 'text'],
+      },
+    },
+    {
+      name: 'send_embed',
+      description: 'Send a rich embed (colored sidebar, title, description, fields, thumbnail, footer) to a Discord channel. Use for status reports, structured updates, or anything where plain markdown would flatten and a glanceable layout helps. For one-line replies prefer `reply`. The optional `text` field lets you @mention someone alongside the embed (embeds themselves do NOT trigger pings).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          title: { type: 'string', description: 'Embed title (truncated to 256 codepoints).' },
+          description: { type: 'string', description: 'Embed body (truncated to 4096 codepoints; markdown supported).' },
+          color: { type: 'string', description: 'Color: hex like "#5865f2" / "5865f2", or a discord.js Colors name (Blurple, Green, Red, Yellow, Fuchsia, Orange, LuminousVividPink, Greyple, White, etc., or "Random"). Lowercase names are auto-capitalized.' },
+          fields: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string' },
+                value: { type: 'string' },
+                inline: { type: 'boolean' },
+              },
+              required: ['name', 'value'],
+            },
+            description: 'Up to 25 fields. name truncated to 256, value to 1024. inline=true displays side-by-side (3 per row max).',
+          },
+          thumbnail_url: { type: 'string', description: 'Image URL — small, top-right of the embed.' },
+          image_url: { type: 'string', description: 'Image URL — full-width, below the description.' },
+          footer: { type: 'string', description: 'Footer text (truncated to 2048 codepoints).' },
+          url: { type: 'string', description: 'URL the title links to.' },
+          reply_to: { type: 'string', description: 'Message ID to thread under.' },
+          text: { type: 'string', description: 'Optional plain text sent alongside the embed (e.g. an @mention to ping a user).' },
+        },
+        required: ['chat_id'],
       },
     },
     {
@@ -1094,6 +1133,69 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
         return { content: [{ type: 'text', text: result }] }
       }
+      case 'send_embed': {
+        const chat_id = args.chat_id as string
+        stopTyping(chat_id)
+        const ch = await fetchAllowedChannel(chat_id)
+        if (!('send' in ch)) throw new Error('channel is not sendable')
+
+        const title = args.title as string | undefined
+        const description = args.description as string | undefined
+        const url = args.url as string | undefined
+        const thumbnail_url = args.thumbnail_url as string | undefined
+        const image_url = args.image_url as string | undefined
+        const footer = args.footer as string | undefined
+        const color = args.color as string | undefined
+
+        const embed = new EmbedBuilder()
+        if (title) embed.setTitle(safeSlice(title, 256))
+        if (description) embed.setDescription(safeSlice(description, 4096))
+        if (url) embed.setURL(url)
+        if (thumbnail_url) embed.setThumbnail(thumbnail_url)
+        if (image_url) embed.setImage(image_url)
+        if (footer) embed.setFooter({ text: safeSlice(footer, 2048) })
+        if (color) {
+          // resolveColor's named-color lookup is case-sensitive (`Blurple`,
+          // not `blurple`). Auto-capitalize purely-alpha input so callers
+          // don't have to think about it. Hex starts with `#` or a digit,
+          // both no-op under capitalize.
+          const normalized = /^[a-z]+$/i.test(color)
+            ? color.charAt(0).toUpperCase() + color.slice(1).toLowerCase()
+            : color
+          try {
+            embed.setColor(resolveColor(normalized as ColorResolvable))
+          } catch {
+            throw new Error(`invalid color: ${color} (use hex like #5865f2 or a discord.js Colors name like 'Blurple')`)
+          }
+        }
+        if (Array.isArray(args.fields)) {
+          const raw = args.fields as Array<{ name?: unknown; value?: unknown; inline?: unknown }>
+          if (raw.length > 25) throw new Error(`Discord allows max 25 embed fields (got ${raw.length})`)
+          const fields = raw.map((f, i) => {
+            if (typeof f.name !== 'string' || typeof f.value !== 'string') {
+              throw new Error(`field[${i}] missing name or value`)
+            }
+            return {
+              name: safeSlice(f.name, 256),
+              value: safeSlice(f.value, 1024),
+              inline: f.inline === true,
+            }
+          })
+          embed.addFields(fields)
+        }
+
+        const reply_to = args.reply_to as string | undefined
+        const text = args.text as string | undefined
+        const sent = await ch.send({
+          ...(text ? { content: text } : {}),
+          embeds: [embed],
+          ...(reply_to
+            ? { reply: { messageReference: reply_to, failIfNotExists: false } }
+            : {}),
+        })
+        noteSent(sent.id)
+        return { content: [{ type: 'text', text: `sent embed (id: ${sent.id})` }] }
+      }
       case 'fetch_messages': {
         const ch = await fetchAllowedChannel(args.channel as string)
         const limit = Math.min((args.limit as number) ?? 20, 100)
@@ -1107,12 +1209,33 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
                 .map(m => {
                   const who = m.author.id === me ? 'me' : m.author.username
                   const atts = m.attachments.size > 0 ? ` +${m.attachments.size}att` : ''
+                  const embs = m.embeds.length > 0 ? ` +${m.embeds.length}emb` : ''
                   // Tool result is newline-joined; multi-line content forges
                   // adjacent rows. History includes ungated senders (no-@mention
                   // messages in an opted-in channel never hit the gate but
                   // still live in channel history).
                   const text = m.content.replace(/[\r\n]+/g, ' ⏎ ')
-                  return `[${m.createdAt.toISOString()}] ${who}: ${text}  (id: ${m.id}${atts})`
+                  const main = `[${m.createdAt.toISOString()}] ${who}: ${text}  (id: ${m.id}${atts}${embs})`
+                  // Indented embed sub-lines so callers can grep for content
+                  // (woodblock titles, PR card descriptions, etc.) that would
+                  // otherwise be opaque from the main message string.
+                  const embedLines = m.embeds.map((e, i) => {
+                    const parts: string[] = []
+                    if (e.title) parts.push(`title=${JSON.stringify(safeSlice(e.title, 200))}`)
+                    if (e.description) {
+                      // Slice first (cheap fast-path when small) then collapse
+                      // newlines on the truncated output — saves work on long
+                      // descriptions where most of the string is discarded.
+                      parts.push(`desc=${JSON.stringify(safeSlice(e.description, 400).replace(/[\r\n]+/g, ' ⏎ '))}`)
+                    }
+                    if (e.url) parts.push(`url=${e.url}`)
+                    if (e.fields.length) parts.push(`fields=${e.fields.length}`)
+                    if (e.footer?.text) parts.push(`footer=${JSON.stringify(safeSlice(e.footer.text, 120))}`)
+                    if (e.image?.url) parts.push(`image=${e.image.url}`)
+                    if (e.thumbnail?.url) parts.push(`thumbnail=${e.thumbnail.url}`)
+                    return `    embed[${i}]: ${parts.join(' ')}`
+                  })
+                  return [main, ...embedLines].join('\n')
                 })
                 .join('\n')
         return { content: [{ type: 'text', text: out }] }
