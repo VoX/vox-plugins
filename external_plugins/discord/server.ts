@@ -746,6 +746,12 @@ function safeAttName(att: Attachment): string {
   return (att.name ?? att.id).replace(/[\[\]\r\n;]/g, '_')
 }
 
+function formatSendResult(ids: string[]): string {
+  return ids.length === 1
+    ? `sent (id: ${ids[0]})`
+    : `sent ${ids.length} parts (ids: ${ids.join(', ')})`
+}
+
 // JS string `.slice(0, N)` operates on UTF-16 code units. Multi-codepoint
 // emoji (any character outside the BMP — e.g. 🦝, 🫡, 🐧) take TWO code
 // units; cutting between them strands a lone high surrogate that JSON
@@ -755,12 +761,6 @@ function safeAttName(att: Attachment): string {
 // integrity. (Doesn't handle ZWJ-glued sequences like 👨‍👩‍👧‍👦 as a
 // single grapheme — those split into component emoji — but no encoding
 // error, just a visual artifact in a 200-char snippet preview.)
-function formatSendResult(ids: string[]): string {
-  return ids.length === 1
-    ? `sent (id: ${ids[0]})`
-    : `sent ${ids.length} parts (ids: ${ids.join(', ')})`
-}
-
 function safeSlice(str: string, n: number): string {
   // Fast path: most strings (titles, footers, single-line snippets) are
   // already under the cap, so skip the codepoint walk entirely.
@@ -785,6 +785,28 @@ function stopTyping(chatId: string): void {
   if (existing) {
     clearInterval(existing)
     typingIntervals.delete(chatId)
+  }
+}
+
+// The standard "open a channel for sending" preamble shared by reply,
+// send_embed, and bulk_reply. Stops the typing indicator (we're about to
+// send a real message, no point in still showing typing), gates through
+// the access allowlist, and asserts the channel can actually receive
+// messages. Throws on access-denied or non-sendable; caller catches.
+async function openSendable(chatId: string) {
+  stopTyping(chatId)
+  const ch = await fetchAllowedChannel(chatId)
+  if (!('send' in ch)) throw new Error('channel is not sendable')
+  return ch
+}
+
+// Allowlist URL schemes for embed url/thumbnail_url/image_url to keep
+// `javascript:` / `data:` / unknown protocols out of attacker-controlled
+// embed fields. Discord clients refuse to render most non-http(s), but
+// the API accepts them and `setURL` (title link) is not proxied.
+function assertEmbedUrl(field: string, value: string): void {
+  if (!/^https?:\/\//i.test(value)) {
+    throw new Error(`${field} must be an http(s) URL (got: ${safeSlice(value, 80)})`)
   }
 }
 
@@ -962,10 +984,22 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             },
             description: 'Up to 25 fields. name truncated to 256, value to 1024. inline=true displays side-by-side (3 per row max).',
           },
-          thumbnail_url: { type: 'string', description: 'Image URL — small, top-right of the embed.' },
-          image_url: { type: 'string', description: 'Image URL — full-width, below the description.' },
+          thumbnail_url: { type: 'string', description: 'Image URL — small, top-right of the embed. Must be http(s).' },
+          image_url: { type: 'string', description: 'Image URL — full-width, below the description. Must be http(s).' },
           footer: { type: 'string', description: 'Footer text (truncated to 2048 codepoints).' },
-          url: { type: 'string', description: 'URL the title links to.' },
+          url: { type: 'string', description: 'URL the title links to. Must be http(s).' },
+          author: {
+            type: 'object',
+            description: 'Optional author block at the top of the embed (above the title).',
+            properties: {
+              name: { type: 'string', description: 'Author display name (truncated to 256 codepoints). Required if author is set.' },
+              url: { type: 'string', description: 'Optional URL for the author name to link to. Must be http(s).' },
+              icon_url: { type: 'string', description: 'Optional small avatar URL shown next to the author name. Must be http(s).' },
+            },
+          },
+          timestamp: {
+            description: 'Optional timestamp shown at the bottom of the embed. Pass `true` for "now", or an ISO-8601 string for a specific moment.',
+          },
           reply_to: { type: 'string', description: 'Message ID to thread under.' },
           text: { type: 'string', description: 'Optional plain text sent alongside the embed (e.g. an @mention to ping a user).' },
         },
@@ -974,7 +1008,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'bulk_reply',
-      description: 'Send the same plain-text message to multiple Discord channels in one tool call. Sends in parallel; one channel\'s failure does not block the others. Returns a per-channel result. Use for cron-style fan-out status updates. For embeds use one `send_embed` per channel; for replies-with-attachments use `reply` per channel.',
+      description: 'Send the same plain-text message to multiple Discord channels in one tool call. Sends in parallel; one channel\'s failure does not block the others. Returns a per-channel result with success ids or partial-send count + error per failed channel. Use for cron-style fan-out status updates. Note: `replyToMode` from access.json is NOT honored here — bulk_reply always sends fresh, no quote-thread. For embeds use one `send_embed` per channel; for replies-with-attachments or quote-replies use `reply` per channel.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1127,9 +1161,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const reply_to = args.reply_to as string | undefined
         const files = (args.files as string[] | undefined) ?? []
 
-        stopTyping(chat_id)
-        const ch = await fetchAllowedChannel(chat_id)
-        if (!('send' in ch)) throw new Error('channel is not sendable')
+        const ch = await openSendable(chat_id)
 
         for (const f of files) {
           assertSendable(f)
@@ -1171,9 +1203,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'send_embed': {
         const chat_id = args.chat_id as string
-        stopTyping(chat_id)
-        const ch = await fetchAllowedChannel(chat_id)
-        if (!('send' in ch)) throw new Error('channel is not sendable')
+        const ch = await openSendable(chat_id)
 
         const title = args.title as string | undefined
         const description = args.description as string | undefined
@@ -1182,6 +1212,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const image_url = args.image_url as string | undefined
         const footer = args.footer as string | undefined
         const color = args.color as string | undefined
+        const author = args.author as { name?: unknown; url?: unknown; icon_url?: unknown } | undefined
+        const timestamp = args.timestamp as string | boolean | undefined
+
+        if (url) assertEmbedUrl('url', url)
+        if (thumbnail_url) assertEmbedUrl('thumbnail_url', thumbnail_url)
+        if (image_url) assertEmbedUrl('image_url', image_url)
 
         const embed = new EmbedBuilder()
         if (title) embed.setTitle(safeSlice(title, 256))
@@ -1190,6 +1226,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         if (thumbnail_url) embed.setThumbnail(thumbnail_url)
         if (image_url) embed.setImage(image_url)
         if (footer) embed.setFooter({ text: safeSlice(footer, 2048) })
+        if (author && typeof author.name === 'string') {
+          if (typeof author.url === 'string') assertEmbedUrl('author.url', author.url)
+          if (typeof author.icon_url === 'string') assertEmbedUrl('author.icon_url', author.icon_url)
+          embed.setAuthor({
+            name: safeSlice(author.name, 256),
+            ...(typeof author.url === 'string' ? { url: author.url } : {}),
+            ...(typeof author.icon_url === 'string' ? { iconURL: author.icon_url } : {}),
+          })
+        }
+        if (timestamp === true) {
+          embed.setTimestamp(new Date())
+        } else if (typeof timestamp === 'string') {
+          const t = Date.parse(timestamp)
+          if (isNaN(t)) throw new Error(`invalid timestamp: ${timestamp} (use ISO-8601 or boolean true for now)`)
+          embed.setTimestamp(new Date(t))
+        }
         if (color) {
           // resolveColor's named-color lookup is case-sensitive (`Blurple`,
           // not `blurple`). Auto-capitalize purely-alpha input so callers
@@ -1250,9 +1302,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           chat_ids.map(async chat_id => {
             const sentIds: string[] = []
             try {
-              stopTyping(chat_id)
-              const ch = await fetchAllowedChannel(chat_id)
-              if (!('send' in ch)) throw new Error('channel is not sendable')
+              const ch = await openSendable(chat_id)
               for (const c of chunks) {
                 const sent = await ch.send({ content: c })
                 noteSent(sent.id)
@@ -1292,33 +1342,38 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         if (user.globalName) lines.push(`global_name=${user.globalName}`)
         lines.push(`avatar=${user.displayAvatarURL({ size: 256 })}`)
         lines.push(`bot=${user.bot}`)
-        // Parallel guild fetch — bot may be in many servers and most lookups
-        // miss. Catch ONLY `Unknown Member` (10007); rate limits / permission
-        // errors / network failures must surface or callers see a false "user
-        // is in no guilds" result that masks real problems.
+        // Parallel guild fetch with isolated failures: 10007 (Unknown Member)
+        // is the expected "user not in this guild" miss, suppressed silently.
+        // Other errors (rate limit, missing access, network) get surfaced as
+        // a `guild[N] error=...` row so the caller sees both the successful
+        // memberships AND the gaps — Promise.all would discard all the wins
+        // when any one guild errored non-10007.
         const guilds = [...client.guilds.cache.values()]
-        const memberships = await Promise.all(
-          guilds.map(async guild => {
-            try {
-              return { guild, member: await guild.members.fetch(user_id) }
-            } catch (err) {
-              if (err instanceof DiscordAPIError && err.code === 10007) return null
-              throw err
-            }
-          }),
+        const memberships = await Promise.allSettled(
+          guilds.map(async guild => ({ guild, member: await guild.members.fetch(user_id) })),
         )
         let shared = 0
-        for (const m of memberships) {
-          if (!m) continue
-          const roles = m.member.roles.cache
-            .filter(r => r.name !== '@everyone')
-            .map(r => r.name)
-            .sort()
-            .join(', ')
-          const display = ` display_name=${JSON.stringify(m.member.displayName)}`
-          const nick = m.member.nickname ? ` nick=${JSON.stringify(m.member.nickname)}` : ''
-          lines.push(`guild[${shared}] id=${m.guild.id} name=${JSON.stringify(m.guild.name)}${display}${nick} roles=${JSON.stringify(roles)}`)
-          shared++
+        for (let i = 0; i < memberships.length; i++) {
+          const result = memberships[i]
+          const guild = guilds[i]
+          if (result.status === 'fulfilled') {
+            const m = result.value
+            const roles = m.member.roles.cache
+              .filter(r => r.name !== '@everyone')
+              .map(r => r.name)
+              .sort()
+              .join(', ')
+            const display = ` display_name=${JSON.stringify(m.member.displayName)}`
+            const nick = m.member.nickname ? ` nick=${JSON.stringify(m.member.nickname)}` : ''
+            lines.push(`guild[${shared}] id=${m.guild.id} name=${JSON.stringify(m.guild.name)}${display}${nick} roles=${JSON.stringify(roles)}`)
+            shared++
+          } else {
+            const err = result.reason
+            if (err instanceof DiscordAPIError && err.code === 10007) continue
+            const msg = err instanceof Error ? err.message : String(err)
+            lines.push(`guild[${shared}] id=${guild.id} name=${JSON.stringify(guild.name)} error=${JSON.stringify(msg)}`)
+            shared++
+          }
         }
         if (shared === 0) lines.push('(user is not a member of any guild this bot is in)')
         return { content: [{ type: 'text', text: lines.join('\n') }] }
@@ -1396,18 +1451,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
         const destDir = args.dest_dir as string | undefined
         if (destDir) mkdirSync(destDir, { recursive: true })
-        const lines: string[] = []
-        for (const att of msg.attachments.values()) {
-          const path = await downloadAttachment(att)
-          const kb = (att.size / 1024).toFixed(0)
-          let finalPath = path
-          if (destDir) {
-            const destPath = join(destDir, safeAttName(att))
-            copyFileSync(path, destPath)
-            finalPath = destPath
-          }
-          lines.push(`  ${finalPath}  (${safeAttName(att)}, ${att.contentType ?? 'unknown'}, ${kb}KB)`)
-        }
+        // Parallel fetch + (re)encode — Discord allows up to 10 attachments
+        // per message, each with its own URL. Sharp's downscale is the
+        // expensive bit but libvips serializes its own threadpool, so 10
+        // parallel pipelines on a 4-core box don't overcommit.
+        const lines = await Promise.all(
+          [...msg.attachments.values()].map(async att => {
+            const path = await downloadAttachment(att)
+            const kb = (att.size / 1024).toFixed(0)
+            let finalPath = path
+            if (destDir) {
+              const destPath = join(destDir, safeAttName(att))
+              copyFileSync(path, destPath)
+              finalPath = destPath
+            }
+            return `  ${finalPath}  (${safeAttName(att)}, ${att.contentType ?? 'unknown'}, ${kb}KB)`
+          }),
+        )
         return {
           content: [{ type: 'text', text: `downloaded ${lines.length} attachment(s):\n${lines.join('\n')}` }],
         }
