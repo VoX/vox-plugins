@@ -736,6 +736,19 @@ function safeAttName(att: Attachment): string {
   return (att.name ?? att.id).replace(/[\[\]\r\n;]/g, '_')
 }
 
+// JS string `.slice(0, N)` operates on UTF-16 code units. Multi-codepoint
+// emoji (any character outside the BMP — e.g. 🦝, 🫡, 🐧) take TWO code
+// units; cutting between them strands a lone high surrogate that JSON
+// encodes as `\ud83e` and Anthropic's parser rejects with HTTP 400 — which
+// poisons every subsequent reply on session resume. `Array.from(str)`
+// iterates by codepoint, so slicing the resulting array preserves emoji
+// integrity. (Doesn't handle ZWJ-glued sequences like 👨‍👩‍👧‍👦 as a
+// single grapheme — those split into component emoji — but no encoding
+// error, just a visual artifact in a 200-char snippet preview.)
+function safeSlice(str: string, n: number): string {
+  return Array.from(str).slice(0, n).join('')
+}
+
 // Active typing intervals per channel — cleared when a reply is sent.
 const typingIntervals = new Map<string, ReturnType<typeof setInterval>>()
 
@@ -1394,12 +1407,12 @@ function summarizeTailRaw(lines: string[]): { lastAction: string; lastTs: number
     if (Array.isArray(content)) {
       for (const c of content) {
         if (c.type === 'text' && typeof c.text === 'string' && c.text.trim()) {
-          lastAction = c.text.replace(/\s+/g, ' ').slice(0, 200)
+          lastAction = safeSlice(c.text.replace(/\s+/g, ' '), 200)
           foundAction = true
           break
         }
         if (c.type === 'tool_use') {
-          lastAction = `tool: ${c.name} ${JSON.stringify(c.input ?? {}).slice(0, 80)}`
+          lastAction = `tool: ${c.name} ${safeSlice(JSON.stringify(c.input ?? {}), 80)}`
           foundAction = true
           break
         }
@@ -1423,14 +1436,14 @@ function buildSummaryPrompt(lines: string[]): string {
       let snippet = ''
       if (c.type === 'text' && typeof c.text === 'string') {
         if (c.text.includes('<system-reminder>')) continue
-        snippet = `assistant: ${c.text.replace(/\s+/g, ' ').slice(0, 400)}`
+        snippet = `assistant: ${safeSlice(c.text.replace(/\s+/g, ' '), 400)}`
       } else if (c.type === 'tool_use') {
-        snippet = `tool_use: ${c.name} ${JSON.stringify(c.input ?? {}).slice(0, 200)}`
+        snippet = `tool_use: ${c.name} ${safeSlice(JSON.stringify(c.input ?? {}), 200)}`
       } else if (c.type === 'tool_result') {
         const txt = typeof c.content === 'string' ? c.content
           : Array.isArray(c.content) ? c.content.map((x: { text?: string }) => x.text ?? '').join(' ')
           : ''
-        snippet = `tool_result: ${txt.replace(/\s+/g, ' ').slice(0, 600)}`
+        snippet = `tool_result: ${safeSlice(txt.replace(/\s+/g, ' '), 600)}`
       }
       if (snippet) {
         if (totalChars + snippet.length > 3000) break
@@ -1666,9 +1679,9 @@ client.on('interactionCreate', async (interaction: Interaction) => {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {})
       try {
         const reply = await buildStatusReply()
-        await interaction.editReply({ content: reply.slice(0, 1900) }).catch(() => {})
+        await interaction.editReply({ content: safeSlice(reply, 1900) }).catch(() => {})
       } catch (e) {
-        await interaction.editReply({ content: `status failed: ${String(e).slice(0, 200)}` }).catch(() => {})
+        await interaction.editReply({ content: `status failed: ${safeSlice(String(e), 200)}` }).catch(() => {})
       }
       return
     }
@@ -1874,7 +1887,7 @@ async function handleInbound(msg: Message): Promise<void> {
       replyMeta = {
         reply_to: refMsg.id,
         reply_to_author: refMsg.author.username,
-        reply_to_content: await resolveMentions(refMsg.content?.slice(0, 200) || ''),
+        reply_to_content: await resolveMentions(safeSlice(refMsg.content || '', 200)),
       }
     } catch {
       // Referenced message may have been deleted — silently skip
