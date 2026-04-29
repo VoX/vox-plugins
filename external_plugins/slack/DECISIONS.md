@@ -46,6 +46,34 @@ Inbound `<channel>` tag includes `source="slack"`, `team_id`, `chat_id`, `messag
 
 - Capped at 50MB per file (slack's tier-1 limit is much higher, but this matches discord's spirit of "don't fill the inbox"). Adjust upward if you need bigger uploads.
 
+## ⚠️ One blocker: marketplace cache needs a push
+
+The plugin loader looks up `plugin:slack@vox-plugins` in the cached
+marketplace at `~/.claude/plugins/marketplaces/vox-plugins/.claude-plugin/marketplace.json`,
+which is a clone of `https://github.com/VoX/vox-plugins.git`. My
+commits add slack to `marketplace.json` and to `external_plugins/slack/`,
+but they are **local only** — the cached marketplace doesn't see them.
+
+Restarted with `plugin:slack@vox-plugins` in `BOT_PLUGINS`; claude
+silently skipped the plugin (no `bun server.ts` for slack, no error in
+journal — discord + scheduler still loaded fine). Smoke test confirms
+the plugin code itself works.
+
+To actually load slack, the workflow is:
+
+1. `git push origin main` from `~/projects/vox-plugins/`
+2. `claude plugin marketplace update vox-plugins`
+3. `claude plugin install slack@vox-plugins`
+4. Restart `claude-discord@tinyclaw`
+
+Step 1 is unauthorized for me (push to public repo without explicit
+ask). Holding for VoX to either push themselves or authorize.
+
+Workaround if you want to test before pushing: temporarily change the
+marketplace source to `file:///home/ec2-user/projects/vox-plugins`
+in `~/.claude/plugins/known_marketplaces.json`, run
+`marketplace update`, install, restart. Revert when done.
+
 ## Open follow-ups (not blockers)
 
 - Port discord plugin's permission relay to slack (Block Kit actions buttons can drive the same flow).
