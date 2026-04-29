@@ -103,11 +103,11 @@ describe('mdToMrkdwn', () => {
     expect(mdToMrkdwn('quote: <!here>')).toBe('quote: &lt;!here&gt;')
     expect(mdToMrkdwn('ping <!everyone>')).toBe('ping &lt;!everyone&gt;')
   })
-  test('escapes <@U…> user mentions in echoed prose', () => {
-    expect(mdToMrkdwn('user typed <@U06ABC123> to ping')).toBe('user typed &lt;@U06ABC123&gt; to ping')
+  test('does NOT escape <@U…> user mentions — bot needs to emit them intentionally', () => {
+    expect(mdToMrkdwn('hi <@U06ABC123>')).toBe('hi <@U06ABC123>')
   })
-  test('escapes <#C…|name> channel mentions', () => {
-    expect(mdToMrkdwn('see <#C123|general>')).toBe('see &lt;#C123|general&gt;')
+  test('does NOT escape <#C…|name> channel mentions', () => {
+    expect(mdToMrkdwn('see <#C123|general>')).toBe('see <#C123|general>')
   })
   test('leaves bare <https://…> autolinks alone', () => {
     expect(mdToMrkdwn('docs at <https://example.com>'))

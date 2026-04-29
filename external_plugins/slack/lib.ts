@@ -66,15 +66,17 @@ export function mdToMrkdwn(text: string): string {
 
 function transformProse(text: string): string {
   // Targeted slack-mrkdwn injection guard: a user pasting `<!channel>`
-  // or `<@U…>` into a message we echo back would otherwise broadcast
-  // the workspace or ping unrelated users. Escape ONLY the dangerous
-  // forms (broadcast keywords, user mentions, channel mentions);
-  // leave bare `<https://…>` autolinks and `<text|label>` slack-link
-  // emit-form alone so the model's intentional output still works.
+  // or `<!here>` into a message we echo back would otherwise broadcast
+  // to the entire workspace. Only escape the BROADCAST forms; user
+  // mentions (`<@U…>`) and channel mentions (`<#C…>`) are NOT broadcast
+  // vectors — they ping/link a specific user/channel, which is the
+  // same shape the bot uses when intentionally tagging someone, so
+  // escaping them would break the bot's own outbound mentions.
+  // Echo-ping risk (user pastes raw `<@U123>` → bot quotes it →
+  // pings U123) is accepted as low impact given that the bot rarely
+  // verbatim-quotes raw IDs.
   let out = text
     .replace(/<!(here|channel|everyone|subteam\^[A-Z0-9]+(?:\|[^>]+)?)>/g, '&lt;!$1&gt;')
-    .replace(/<@(U[A-Z0-9]+)>/g, '&lt;@$1&gt;')
-    .replace(/<#(C[A-Z0-9]+(?:\|[^>]+)?)>/g, '&lt;#$1&gt;')
   // **bold** → *bold*. Non-greedy, escape-aware.
   out = out.replace(/(?<!\\)\*\*([^*\n]+?)\*\*/g, '*$1*')
   // ~~strike~~ → ~strike~. Same shape.

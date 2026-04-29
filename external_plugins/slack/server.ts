@@ -55,7 +55,7 @@ import {
 // respond, but with zero tools, no .env load, no Socket Mode connection,
 // no traffic at all.
 if (process.env.VOX_PLUGINS_ENABLED !== '1') {
-  const idle = new Server({ name: 'slack', version: '0.1.11' }, { capabilities: { tools: {} } })
+  const idle = new Server({ name: 'slack', version: '0.1.12' }, { capabilities: { tools: {} } })
   idle.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
   await idle.connect(new StdioServerTransport())
   // Idle path needs SIGTERM/stdin-EOF handlers too — without them
@@ -962,7 +962,7 @@ app.event('message', async ({ event }) => {
 
 // --- MCP server ---
 const mcp = new Server(
-  { name: 'slack', version: '0.1.11' },
+  { name: 'slack', version: '0.1.12' },
   {
     capabilities: {
       tools: {},
