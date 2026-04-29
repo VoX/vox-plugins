@@ -34,7 +34,7 @@ type SlackUserMessageEvent = {
   files?: Array<Record<string, unknown>>
 }
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, copyFileSync, unlinkSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, copyFileSync } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
 import sharp from 'sharp'
@@ -54,7 +54,7 @@ import {
 // respond, but with zero tools, no .env load, no Socket Mode connection,
 // no traffic at all.
 if (process.env.VOX_PLUGINS_ENABLED !== '1') {
-  const idle = new Server({ name: 'slack', version: '0.1.6' }, { capabilities: { tools: {} } })
+  const idle = new Server({ name: 'slack', version: '0.1.7' }, { capabilities: { tools: {} } })
   idle.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
   await idle.connect(new StdioServerTransport())
   await new Promise<never>(() => {})
@@ -78,7 +78,13 @@ try {
   chmodSync(ENV_FILE, 0o600)
   for (const line of readFileSync(ENV_FILE, 'utf8').split('\n')) {
     const m = line.match(/^(\w+)=(.*)$/)
-    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
+    if (!m || process.env[m[1]!] !== undefined) continue
+    // Strip optional surrounding single/double quotes so a line like
+    // `SLACK_BOT_TOKEN="xoxb-..."` doesn't leak quote chars into the
+    // Bearer header. The PreCompact hook applies the same strip, this
+    // keeps the two parsers in lockstep.
+    const value = m[2]!.replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1')
+    process.env[m[1]!] = value
   }
 } catch {}
 
@@ -287,10 +293,15 @@ function withAccessLock<T>(fn: () => Promise<T> | T): Promise<T> {
 }
 
 function pruneExpired(a: Access): boolean {
+  // Hot path: every inbound message hits this. Empty pending is the
+  // common case once a workspace is paired — short-circuit to avoid
+  // walking an empty map.
+  const codes = Object.keys(a.pending)
+  if (codes.length === 0) return false
   const now = Date.now()
   let changed = false
-  for (const [code, p] of Object.entries(a.pending)) {
-    if (p.expiresAt < now) { delete a.pending[code]; changed = true }
+  for (const code of codes) {
+    if (a.pending[code]!.expiresAt < now) { delete a.pending[code]; changed = true }
   }
   return changed
 }
@@ -339,12 +350,26 @@ async function loadSelf(): Promise<void> {
   BOT_USER_ID = (auth.user_id as string) ?? ''
   TEAM_ID = (auth.team_id as string) ?? ''
   BOT_HANDLE = (auth.user as string) ?? ''
+  if (!BOT_USER_ID) {
+    // Empty BOT_USER_ID makes the mention check `text.includes("<@>")` match
+    // any string with a literal `<@>` (false positives) and breaks the
+    // self-loop guard `msg.user === BOT_USER_ID`. Fail boot rather than
+    // run with broken identity.
+    throw new Error(`slack auth.test returned no user_id; cannot start without bot identity`)
+  }
   process.stderr.write(`slack channel: bot=${BOT_HANDLE} (${BOT_USER_ID}) team=${TEAM_ID}\n`)
+}
+
+// Escape a string for safe interpolation into a regex pattern. BOT_HANDLE
+// comes from auth.test (workspace-controlled) and may contain `.` or `-`
+// which would otherwise over-match (or `(` which would throw).
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function isMentioned(text: string, mentionPatterns?: string[]): boolean {
   if (BOT_USER_ID && text.includes(`<@${BOT_USER_ID}>`)) return true
-  if (BOT_HANDLE && new RegExp(`(^|\\s)@${BOT_HANDLE}(\\s|$)`, 'i').test(text)) return true
+  if (BOT_HANDLE && new RegExp(`(^|\\s)@${escapeRegex(BOT_HANDLE)}(\\s|$)`, 'i').test(text)) return true
   for (const pat of mentionPatterns ?? []) {
     try { if (new RegExp(pat, 'i').test(text)) return true } catch {}
   }
@@ -401,7 +426,9 @@ async function gate(event: SlackUserMessageEvent): Promise<GateResult> {
   if (access.dmPolicy === 'disabled') return { action: 'drop' }
   const policy = access.groups[event.channel]
   if (!policy) return { action: 'drop' }
-  if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(senderId)) return { action: 'drop' }
+  // Hand-edited access.json may set allowFrom to null/undefined. Coalesce.
+  const policyAllow = policy.allowFrom ?? []
+  if (policyAllow.length > 0 && !policyAllow.includes(senderId)) return { action: 'drop' }
   // requireMention defaults true — channels are noisy by default, opt-in
   // is the safer floor.
   const requireMention = policy.requireMention ?? true
@@ -428,6 +455,14 @@ function checkApprovals(): void {
     let dmChannelId: string
     try { dmChannelId = readFileSync(file, 'utf8').trim() } catch { rmSync(file, { force: true }); continue }
     if (!dmChannelId) { rmSync(file, { force: true }); continue }
+    // Defense against a hand-crafted approved/<sender> file with a
+    // non-DM channel id: refuse to post the "Paired!" confirm anywhere
+    // but a 1:1 DM. Marker is dropped either way.
+    if (!dmChannelId.startsWith('D')) {
+      process.stderr.write(`slack channel: refusing approval confirm — chatId="${dmChannelId}" is not a DM channel\n`)
+      rmSync(file, { force: true })
+      continue
+    }
     void (async () => {
       try {
         await app.client.chat.postMessage({
@@ -472,7 +507,7 @@ function assertSendable(f: string): void {
 
 // Resize images so the on-disk path that lands in the session jsonl
 // stays under Anthropic's vision API caps. Animated images skip.
-async function maybeDownscaleImage(buf: Buffer, contentType: string | null): Promise<Buffer<ArrayBufferLike>> {
+async function maybeDownscaleImage(buf: Buffer, contentType: string | null): Promise<Buffer> {
   if (!contentType?.startsWith('image/')) return buf
   let pipeline: sharp.Sharp
   let meta: sharp.Metadata
@@ -518,7 +553,9 @@ async function downloadSlackFile(url: string, name: string, contentType: string 
   const rawExt = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : 'bin'
   const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
   const path = join(INBOX_DIR, `${Date.now()}-${randomBytes(3).toString('hex')}.${ext}`)
-  writeFileSync(path, buf)
+  // Inbox files can hold uploaded content from any allowlisted channel.
+  // Lock to owner-only — the downloader is the only consumer.
+  writeFileSync(path, buf, { mode: 0o600 })
   return path
 }
 
@@ -586,11 +623,15 @@ app.event('message', async ({ event }) => {
     return
   }
 
-  // Dunk gate
+  // Dunk gate. allow_mentions reuses the gate's mention semantics —
+  // including "thread reply to one of our recent messages" — so a user
+  // replying to the bot inside a dunked-with-allow-mentions channel
+  // still gets through.
   const dunk = checkDunk(msg.channel)
   if (dunk) {
     const text = msg.text ?? ''
-    const mentioned = isMentioned(text, result.access.mentionPatterns)
+    const inThreadOnUs = !!msg.thread_ts && recentSentTs.has(msg.thread_ts)
+    const mentioned = inThreadOnUs || isMentioned(text, result.access.mentionPatterns)
     if (!(dunk.allow_mentions && mentioned)) return
   }
 
@@ -669,7 +710,7 @@ app.event('message', async ({ event }) => {
 
 // --- MCP server ---
 const mcp = new Server(
-  { name: 'slack', version: '0.1.6' },
+  { name: 'slack', version: '0.1.7' },
   {
     capabilities: {
       tools: {},
@@ -693,7 +734,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: 'reply',
-      description: 'Reply on Slack. Pass chat_id from the inbound message. Optionally pass thread_ts (set to a message ts) to reply inside a thread, and files (absolute paths) for attachments.',
+      description: 'Reply on Slack. Pass chat_id from the inbound message. Optionally pass thread_ts (set to a message ts) to reply inside a thread, and files (absolute paths) for attachments. NOTE: when files are attached, the first chunk\'s return id is a synthetic `file:<file_id>` (slack\'s files.uploadV2 doesn\'t return the chat ts). That id is NOT usable with edit_message/react/pin_message — use fetch_messages to find the real ts if you need to follow up.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -942,7 +983,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'fetch_messages': {
         const channel = args.channel as string
-        const limit = Math.min(Math.max(1, (args.limit as number) ?? 20), 100)
+        // Coerce to a finite positive int — `NaN`/non-finite would
+        // propagate through Math.max/min and slack would 400 on it.
+        const requested = Number(args.limit)
+        const limit = Number.isFinite(requested) && requested > 0
+          ? Math.min(Math.floor(requested), 100)
+          : 20
         const thread_ts = args.thread_ts as string | undefined
         await assertChannelAllowed(channel)
         const r = thread_ts
@@ -950,17 +996,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           : await app.client.conversations.history({ channel, limit })
         const msgs = (r.messages ?? []).slice().reverse()
         if (msgs.length === 0) return { content: [{ type: 'text', text: '(no messages)' }] }
-        const out = await Promise.all(msgs.map(async (m: any) => {
+        // Pre-resolve unique user ids in one batch — `Promise.all` over a
+        // 100-message page would otherwise fire 100 parallel users.info
+        // calls on a cold cache and bump the slack tier-4 ceiling.
+        const uniqueUsers = new Set<string>()
+        for (const m of msgs as any[]) {
+          if (m.user && m.user !== BOT_USER_ID) uniqueUsers.add(String(m.user))
+        }
+        await Promise.all([...uniqueUsers].map(id => resolveDisplayName(id)))
+        const out = msgs.map((m: any) => {
           let who: string
           if (m.user === BOT_USER_ID) who = 'me'
-          else if (m.user) who = await resolveDisplayName(String(m.user))
+          else if (m.user) who = usernameCache.get(String(m.user)) ?? String(m.user)
           else who = String(m.bot_id ?? 'unknown')
           const fileCount = Array.isArray(m.files) ? m.files.length : 0
           const filesPart = fileCount > 0 ? ` +${fileCount}file` : ''
           const tsIso = new Date(parseFloat(String(m.ts)) * 1000).toISOString()
           const text = String(m.text ?? '').replace(/[\r\n]+/g, ' ⏎ ')
           return `[${tsIso}] ${who}: ${text}  (ts: ${m.ts}${filesPart})`
-        }))
+        })
         return { content: [{ type: 'text', text: out.join('\n') }] }
       }
       case 'get_user_info': {
@@ -987,9 +1041,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const message_id = args.message_id as string
         const dest_dir = args.dest_dir as string | undefined
         await assertChannelAllowed(chat_id)
-        // No direct "get message by ts" API; use conversations.replies(ts=message_id)
-        // — that returns the parent + its thread (if any). We just want the parent.
-        const r = await app.client.conversations.replies({ channel: chat_id, ts: message_id, limit: 1, inclusive: true })
+        // Slack has no direct "get message by ts" API. `conversations.replies`
+        // with limit=1 returns the THREAD ROOT — wrong if `message_id` is
+        // a reply inside a thread. `conversations.history` with
+        // latest=oldest=ts and inclusive=true is the right shape: returns
+        // exactly the message at that ts regardless of thread context.
+        const r = await app.client.conversations.history({
+          channel: chat_id,
+          latest: message_id,
+          oldest: message_id,
+          inclusive: true,
+          limit: 1,
+        })
         const m: any = r.messages?.[0]
         if (!m) throw new Error(`message not found: chat_id=${chat_id} ts=${message_id}`)
         const files: any[] = Array.isArray(m.files) ? m.files : []

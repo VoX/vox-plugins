@@ -21,13 +21,9 @@ features:
 oauth_config:
   scopes:
     bot:
-      - app_mentions:read
+      # Read channel + thread history (fetch_messages, download_attachment, thread root resolve).
       - channels:history
       - channels:read
-      - chat:write
-      - chat:write.public
-      - files:read
-      - files:write
       - groups:history
       - groups:read
       - im:history
@@ -35,22 +31,28 @@ oauth_config:
       - im:write
       - mpim:history
       - mpim:read
-      - pins:read
+      # Send messages, including to public channels the bot isn't a member of.
+      - chat:write
+      - chat:write.public
+      # File upload (reply with attachments, send_voice_message) + read for download_attachment.
+      - files:read
+      - files:write
+      # Pins write only — pin_message tool. (Drop pins:read; pins.list isn't called.)
       - pins:write
-      - reactions:read
+      # React only — react tool. (Drop reactions:read; the plugin doesn't react to or read reactions.)
       - reactions:write
+      # User lookup for get_user_info + display-name annotation. Email is sensitive but
+      # opt-in-friendly: drop `users:read.email` if you'd rather not expose workspace emails.
       - users:read
       - users:read.email
 settings:
   event_subscriptions:
     bot_events:
-      - app_mention
+      # message.* covers @mentions too — separate app_mention subscription is redundant.
       - message.channels
       - message.groups
       - message.im
       - message.mpim
-      - reaction_added
-      - reaction_removed
   socket_mode_enabled: true
   org_deploy_enabled: false
   is_hosted: false

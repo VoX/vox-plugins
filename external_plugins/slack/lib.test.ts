@@ -152,6 +152,20 @@ describe('chunk', () => {
     const out = chunk('hello world', 5)
     expect(out[1]).toBe('world')
   })
+  test('hard-cut at limit doesn\'t strand a high-surrogate (🦝 regression)', () => {
+    // Five raccoons (each 2 UTF-16 units = 10 units total). limit=3 forces
+    // a hard-cut every step since there's no whitespace. Without the
+    // codepoint guard slice(0, 3) would strand a high surrogate.
+    const out = chunk('🦝🦝🦝🦝🦝', 3)
+    for (const piece of out) {
+      // No lone high surrogate at the trailing edge.
+      const last = piece.charCodeAt(piece.length - 1)
+      expect(last >= 0xd800 && last <= 0xdbff).toBe(false)
+      // JSON round-trip survives.
+      expect(() => JSON.parse(JSON.stringify(piece))).not.toThrow()
+    }
+    expect(out.join('')).toBe('🦝🦝🦝🦝🦝')
+  })
 })
 
 describe('isDmChannel', () => {

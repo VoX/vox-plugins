@@ -74,6 +74,47 @@ marketplace source to `file:///home/ec2-user/projects/vox-plugins`
 in `~/.claude/plugins/known_marketplaces.json`, run
 `marketplace update`, install, restart. Revert when done.
 
+## Deferred from the 0.1.7 4-agent review
+
+Substantive findings that fix would have meaningfully changed scope or
+required bigger refactors. Documented here so they're not lost:
+
+- **Extract a shared `channel-core` module across discord + slack** —
+  `withAccessLock`, `pruneExpired`, `recentSentTs`/`noteSent`,
+  `BOOT_ACCESS`, `readAccessFile`, atomic JSON write, dunk subsystem,
+  username cache LRU — all are line-for-line clones between the two
+  plugins. Significant refactor, deferred until a third channel-bridge
+  plugin (telegram?) makes the duplication a real cost.
+- **Move from FIFO eviction to a real LRU** in usernameCache — current
+  drop-the-first-key-on-overflow lies about being LRU (it's FIFO). Names
+  read frequently still get evicted on insertion order.
+- **Cache `loadAccess` in-memory + watch mtime** — `access.json` is
+  parsed from disk on every gate(), assertChannelAllowed(), and
+  chunkOutbound(). For high-volume channels this is a measurable cost.
+  Holding for now since it changes the locking model.
+- **Cache DM-channel→user-id mapping** so `assertChannelAllowed` for
+  DMs doesn't hit `conversations.info` on every send. Discord plugin
+  has `dmChannelUsers` for this; slack should mirror.
+- **Add `gate()` / `applyDunk` / `assertChannelAllowed` unit tests**.
+  Requires mocking @slack/bolt's WebClient or extracting these as pure
+  functions taking an injected client. Significant test infra build-out.
+- **Surface slack rate-limit responses + retry-after** explicitly.
+  Currently the catch-all returns a generic "tool failed" without the
+  retry hint. Bolt's WebAPIRequestError carries this info.
+- **Bot identity refresh** — BOT_USER_ID/HANDLE/TEAM_ID loaded once at
+  boot. On bot rename, app reinstall, or workspace migration, in-memory
+  identity goes stale until restart. Add a 1h refresh timer + a
+  `tokens_revoked`/`app_uninstalled` event handler that triggers reboot.
+- **Drop discord-plugin's `replyToMode` from slack access.json schema** —
+  slack threading is conceptually different and the option doesn't
+  apply. Right now the schema accepts it silently.
+- **Distinguish "channel not opted in" vs "bot not invited to channel"**
+  in the assertChannelAllowed error. Currently both yield the same
+  "not opted in — add via /slack:access" message; if the channel IS in
+  groups but the bot isn't a member, the operator gets misdirected.
+- **Permalink in inbound channel tag** — slack's `chat.getPermalink`
+  is cheap and the model could use it to cite messages back.
+
 ## Open follow-ups (not blockers)
 
 - Port discord plugin's permission relay to slack (Block Kit actions buttons can drive the same flow).

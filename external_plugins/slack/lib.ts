@@ -118,8 +118,14 @@ export function parseSlackMentions(text: string): SlackMention[] {
 // Splits long text at the closest whitespace boundary under `limit` so a
 // single reply can ship across multiple Slack messages without breaking
 // mid-mention or mid-word. Prefers paragraph breaks > line breaks > word
-// breaks > hard cut at limit. Slack's per-message text cap is ~40000
-// chars but blocks have a 3000-char per-section limit; default to 3000.
+// breaks > hard-cut at limit. Slack's per-message text cap is ~40K chars
+// but blocks have a 3000-char per-section limit; default to 3000.
+//
+// Emoji safety: hard-cut at the codepoint boundary, not the UTF-16 unit
+// boundary. `slice(0, n)` would strand a lone surrogate inside any
+// non-BMP emoji (🦝, 🫡, etc.) → JSON encodes as `\ud83e` and Anthropic's
+// parser rejects the resulting message with HTTP 400. Same class of bug
+// `safeSlice` guards above; `chunk` had it open until 0.1.7.
 export function chunk(text: string, limit: number): string[] {
   if (text.length <= limit) return [text]
   const out: string[] = []
@@ -128,7 +134,15 @@ export function chunk(text: string, limit: number): string[] {
     const para = rest.lastIndexOf('\n\n', limit)
     const line = rest.lastIndexOf('\n', limit)
     const space = rest.lastIndexOf(' ', limit)
-    const cut = para > 0 ? para : line > 0 ? line : space > 0 ? space : limit
+    let cut = para > 0 ? para : line > 0 ? line : space > 0 ? space : limit
+    // Codepoint guard for the hard-cut path: `lastIndexOf(' '/'\n', limit)`
+    // always returns a code-unit position pointing at a single-byte char,
+    // so it's safe. The `cut === limit` (no whitespace found) branch is
+    // the one that can land mid-surrogate — back off one unit if it does.
+    if (cut === limit && cut > 0) {
+      const code = rest.charCodeAt(cut - 1)
+      if (code >= 0xd800 && code <= 0xdbff) cut -= 1
+    }
     out.push(rest.slice(0, cut))
     rest = rest.slice(cut).replace(/^\s+/, '')
   }
