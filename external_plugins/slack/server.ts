@@ -54,7 +54,7 @@ import {
 // respond, but with zero tools, no .env load, no Socket Mode connection,
 // no traffic at all.
 if (process.env.VOX_PLUGINS_ENABLED !== '1') {
-  const idle = new Server({ name: 'slack', version: '0.1.7' }, { capabilities: { tools: {} } })
+  const idle = new Server({ name: 'slack', version: '0.1.8' }, { capabilities: { tools: {} } })
   idle.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
   await idle.connect(new StdioServerTransport())
   await new Promise<never>(() => {})
@@ -112,8 +112,14 @@ const usernameCache = new Map<string, string>()
 let usernameCacheDirty = false
 try {
   const raw = readFileSync(USERNAME_CACHE_FILE, 'utf8')
-  for (const [id, name] of Object.entries(JSON.parse(raw) as Record<string, string>)) {
-    usernameCache.set(id, name)
+  const parsed = JSON.parse(raw) as Record<string, string> | null
+  // Guard against `null` / non-object — `Object.entries(null)` throws.
+  if (parsed && typeof parsed === 'object') {
+    for (const [id, name] of Object.entries(parsed)) {
+      if (typeof name === 'string') usernameCache.set(id, name)
+      // Trim on the way in if a hand-edited cache file was huge.
+      if (usernameCache.size >= MAX_USERNAME_CACHE) break
+    }
   }
 } catch {}
 
@@ -160,7 +166,7 @@ async function resolveDisplayName(userId: string): Promise<string> {
 // Loaded once at boot, mutated only by applyDunk/applyUndunk + lazy
 // expiry inside checkDunk. Keeping it in memory means inbound messages
 // don't pay a JSON parse on every event.
-type DunkEntry = { until: number | null; by: string; at: number; allow_mentions?: boolean }
+type DunkEntry = { until: number | null; at: number; allow_mentions?: boolean }
 type DunkedState = Record<string, DunkEntry>
 
 let dunkedState: DunkedState = (() => {
@@ -186,7 +192,7 @@ function checkDunk(chatId: string): DunkEntry | null {
   }
   return entry
 }
-function applyDunk(chatId: string, by: string, durationStr?: string | null, allowMentions?: boolean) {
+function applyDunk(chatId: string, durationStr?: string, allowMentions?: boolean) {
   let until: number | null = null
   if (durationStr) {
     const ms = parseDuration(durationStr)
@@ -194,7 +200,7 @@ function applyDunk(chatId: string, by: string, durationStr?: string | null, allo
     until = Date.now() + ms
   }
   const wasAlready = !!dunkedState[chatId]
-  const entry: DunkEntry = { until, by, at: Date.now() }
+  const entry: DunkEntry = { until, at: Date.now() }
   if (allowMentions) entry.allow_mentions = true
   dunkedState[chatId] = entry
   persistDunkedState()
@@ -255,7 +261,16 @@ function chunkOutbound(text: string): string[] {
 function readAccessFile(): Access {
   try {
     const raw = readFileSync(ACCESS_FILE, 'utf8')
-    return { ...defaultAccess(), ...(JSON.parse(raw) as Partial<Access>) }
+    const parsed = JSON.parse(raw) as Partial<Access> | null
+    if (!parsed || typeof parsed !== 'object') return defaultAccess()
+    // Type-coerce the structured fields. A hand-edited access.json with
+    // `groups: null` would otherwise crash the gate on every inbound
+    // (`event.channel in null` throws). Same for allowFrom and pending.
+    const merged = { ...defaultAccess(), ...parsed } as Access
+    if (!Array.isArray(merged.allowFrom)) merged.allowFrom = []
+    if (!merged.groups || typeof merged.groups !== 'object') merged.groups = {}
+    if (!merged.pending || typeof merged.pending !== 'object') merged.pending = {}
+    return merged
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
     try { renameSync(ACCESS_FILE, `${ACCESS_FILE}.corrupt-${Date.now()}`) } catch {}
@@ -307,15 +322,27 @@ function pruneExpired(a: Access): boolean {
 }
 
 // Track ts of messages we recently sent so reply-to-bot in channels
-// counts as a mention without an extra fetch.
-const recentSentTs = new Set<string>()
+// counts as a mention without an extra fetch. Bounded by both count
+// (keeps memory flat) and age (1h: anyone replying to bot output an
+// hour later is going through the regular gate, not this fast-path).
 const RECENT_SENT_CAP = 200
+const RECENT_SENT_TTL_MS = 60 * 60 * 1000
+const recentSentAt = new Map<string, number>()
 function noteSent(ts: string): void {
-  recentSentTs.add(ts)
-  if (recentSentTs.size > RECENT_SENT_CAP) {
-    const first = recentSentTs.values().next().value
-    if (first) recentSentTs.delete(first)
+  recentSentAt.set(ts, Date.now())
+  if (recentSentAt.size > RECENT_SENT_CAP) {
+    const oldest = recentSentAt.keys().next().value
+    if (oldest !== undefined) recentSentAt.delete(oldest)
   }
+}
+function recentSentTsHas(ts: string): boolean {
+  const at = recentSentAt.get(ts)
+  if (at === undefined) return false
+  if (Date.now() - at > RECENT_SENT_TTL_MS) {
+    recentSentAt.delete(ts)
+    return false
+  }
+  return true
 }
 
 process.on('unhandledRejection', err => {
@@ -357,6 +384,7 @@ async function loadSelf(): Promise<void> {
     // run with broken identity.
     throw new Error(`slack auth.test returned no user_id; cannot start without bot identity`)
   }
+  rebuildBotHandleMention()
   process.stderr.write(`slack channel: bot=${BOT_HANDLE} (${BOT_USER_ID}) team=${TEAM_ID}\n`)
 }
 
@@ -367,10 +395,23 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
+// BOT_HANDLE is fixed for the lifetime of the process (loaded once via
+// auth.test) — compile the @-mention regex once instead of per-event.
+let BOT_HANDLE_MENTION_RE: RegExp | null = null
+function rebuildBotHandleMention(): void {
+  BOT_HANDLE_MENTION_RE = BOT_HANDLE
+    ? new RegExp(`(^|\\s)@${escapeRegex(BOT_HANDLE)}(\\s|$)`, 'i')
+    : null
+}
+
 function isMentioned(text: string, mentionPatterns?: string[]): boolean {
   if (BOT_USER_ID && text.includes(`<@${BOT_USER_ID}>`)) return true
-  if (BOT_HANDLE && new RegExp(`(^|\\s)@${escapeRegex(BOT_HANDLE)}(\\s|$)`, 'i').test(text)) return true
+  if (BOT_HANDLE_MENTION_RE && BOT_HANDLE_MENTION_RE.test(text)) return true
   for (const pat of mentionPatterns ?? []) {
+    // Wrap BOTH compile and test — a malicious / typo'd pattern could
+    // be syntactically valid but have catastrophic backtracking against
+    // attacker-controlled prose. Failing closed (ignore the pattern) is
+    // safer than letting one bad regex stall the inbound loop.
     try { if (new RegExp(pat, 'i').test(text)) return true } catch {}
   }
   return false
@@ -437,7 +478,7 @@ async function gate(event: SlackUserMessageEvent): Promise<GateResult> {
     // Reply-to-our-message also counts as a mention. Slack threading is
     // explicit via thread_ts; if event.thread_ts points at a ts in our
     // recent-sent set, treat it as an implicit mention.
-    const inThreadOnUs = !!event.thread_ts && recentSentTs.has(event.thread_ts)
+    const inThreadOnUs = !!event.thread_ts && recentSentTsHas(event.thread_ts)
     if (!inThreadOnUs && !isMentioned(text, access.mentionPatterns)) {
       return { action: 'drop' }
     }
@@ -447,10 +488,15 @@ async function gate(event: SlackUserMessageEvent): Promise<GateResult> {
 
 // Polling loop for /slack:access pair approvals. Skill drops a file at
 // approved/<senderId>; contents = DM channel id to send confirmation to.
+// In-flight set keyed by senderId. checkApprovals fires every 5s; if a
+// previous tick's chat.postMessage is still pending (slack hiccup), the
+// next tick would re-read the marker and double-post the "Paired!" DM.
+const approvalsInFlight = new Set<string>()
 function checkApprovals(): void {
   let files: string[]
   try { files = readdirSync(APPROVED_DIR) } catch { return }
   for (const senderId of files) {
+    if (approvalsInFlight.has(senderId)) continue
     const file = join(APPROVED_DIR, senderId)
     let dmChannelId: string
     try { dmChannelId = readFileSync(file, 'utf8').trim() } catch { rmSync(file, { force: true }); continue }
@@ -463,6 +509,7 @@ function checkApprovals(): void {
       rmSync(file, { force: true })
       continue
     }
+    approvalsInFlight.add(senderId)
     void (async () => {
       try {
         await app.client.chat.postMessage({
@@ -473,6 +520,7 @@ function checkApprovals(): void {
         process.stderr.write(`slack channel: failed to send approval confirm: ${err}\n`)
       } finally {
         rmSync(file, { force: true })
+        approvalsInFlight.delete(senderId)
       }
     })()
   }
@@ -537,9 +585,21 @@ function safeFileName(name: string): string {
 }
 
 // Slack file urls (url_private_download) require a Bearer token to GET.
+// Hostnames Slack legitimately serves file content from. A crafted file
+// event with `url_private_download` pointing off-host would otherwise
+// receive our Bearer token. Belt-and-suspenders: even though the file
+// metadata came from a Slack-authenticated event, validate the URL
+// before sending the bot token along.
+const SLACK_FILE_HOSTS = /(^|\.)slack\.com$/i
+
 async function downloadSlackFile(url: string, name: string, contentType: string | null, sizeHint?: number): Promise<string> {
   if (sizeHint && sizeHint > MAX_ATTACHMENT_BYTES) {
     throw new Error(`file too large: ${(sizeHint / 1024 / 1024).toFixed(1)}MB, max ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB`)
+  }
+  let host: string
+  try { host = new URL(url).hostname } catch { throw new Error(`malformed file url: ${url}`) }
+  if (!SLACK_FILE_HOSTS.test(host)) {
+    throw new Error(`refusing to attach bot token to non-slack host: ${host} (url=${url})`)
   }
   const res = await fetch(url, { headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` } })
   if (!res.ok) throw new Error(`file fetch failed: ${res.status} ${res.statusText} (${url})`)
@@ -598,11 +658,20 @@ async function annotateMentions(text: string): Promise<string> {
 }
 
 // --- Inbound message handling ---
+// Subtypes we forward to Claude. `undefined` = plain message;
+// `file_share` = user uploaded a file (the most important one — without it
+// every file-upload event is silently dropped and the model never sees an
+// inbox attachment). `me_message` = `/me`-style. `thread_broadcast` = a
+// thread reply that's also broadcast to the channel.
+const DELIVERABLE_SUBTYPES = new Set<string>(['file_share', 'me_message', 'thread_broadcast'])
+
 app.event('message', async ({ event }) => {
-  // Bolt fires 'message' for every subtype: bot_message, channel_join,
-  // message_changed, message_deleted, etc. We only deliver plain user
-  // messages — a 'subtype' field present on the union is the discriminator.
-  if ('subtype' in event && event.subtype) return
+  // Bolt fires 'message' for every subtype (~20 of them: bot_message,
+  // channel_join, message_changed, message_deleted, file_share, …). We
+  // forward plain user messages plus an allowlist of subtypes that are
+  // still real-user content.
+  const subtype = (event as { subtype?: string }).subtype
+  if (subtype && !DELIVERABLE_SUBTYPES.has(subtype)) return
   const msg = event as SlackUserMessageEvent
   if (!msg.user) return
   if (msg.user === BOT_USER_ID) return
@@ -630,17 +699,25 @@ app.event('message', async ({ event }) => {
   const dunk = checkDunk(msg.channel)
   if (dunk) {
     const text = msg.text ?? ''
-    const inThreadOnUs = !!msg.thread_ts && recentSentTs.has(msg.thread_ts)
+    const inThreadOnUs = !!msg.thread_ts && recentSentTsHas(msg.thread_ts)
     const mentioned = inThreadOnUs || isMentioned(text, result.access.mentionPatterns)
     if (!(dunk.allow_mentions && mentioned)) return
   }
 
   if (result.access.ackReaction) {
-    void app.client.reactions.add({
-      channel: msg.channel,
-      timestamp: msg.ts,
-      name: result.access.ackReaction.replace(/^:|:$/g, ''),
-    }).catch(() => {})
+    // Reuse the same shortcode validation the `react` tool uses so a
+    // hand-edited access.json with a unicode emoji doesn't yield a
+    // silent slack 400 every inbound. Failing closed (no reaction)
+    // beats spamming retries.
+    let ack: string | null = null
+    try { ack = normalizeReactionName(result.access.ackReaction) } catch {}
+    if (ack) {
+      void app.client.reactions.add({
+        channel: msg.channel,
+        timestamp: msg.ts,
+        name: ack,
+      }).catch(() => {})
+    }
   }
 
   // File attachment listing (slack delivers files inline on the event
@@ -661,6 +738,12 @@ app.event('message', async ({ event }) => {
     annotateMentions(rawText),
     resolveDisplayName(msg.user),
   ])
+  // Slack ts is `seconds.microseconds` as a string. Malformed input
+  // would propagate as `NaN` through Date and toISOString() throws.
+  const parsedSeconds = parseFloat(msg.ts)
+  const tsIso = Number.isFinite(parsedSeconds)
+    ? new Date(parsedSeconds * 1000).toISOString()
+    : new Date().toISOString()
 
   // Thread context: if msg is a reply in a thread, fetch the root for context.
   let replyMeta: Record<string, string> = {}
@@ -695,7 +778,7 @@ app.event('message', async ({ event }) => {
         message_id: msg.ts,
         user,
         user_id: msg.user,
-        ts: new Date(parseFloat(msg.ts) * 1000).toISOString(),
+        ts: tsIso,
         team_id: TEAM_ID,
         channel_type: msg.channel_type ?? 'unknown',
         ...(msg.thread_ts ? { thread_ts: msg.thread_ts } : {}),
@@ -710,7 +793,7 @@ app.event('message', async ({ event }) => {
 
 // --- MCP server ---
 const mcp = new Server(
-  { name: 'slack', version: '0.1.7' },
+  { name: 'slack', version: '0.1.8' },
   {
     capabilities: {
       tools: {},
@@ -773,7 +856,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'react',
-      description: 'Add an emoji reaction to a Slack message. Emoji must be a Slack shortcode like "thumbsup" or "white_check_mark" (not unicode). Surrounding colons are stripped.',
+      description: 'Add an emoji reaction to a Slack message. Emoji must be a Slack shortcode like "thumbsup" or "white_check_mark". Surrounding colons are stripped. Unicode glyphs like 👍 are rejected with an error — slack would 400 on them anyway.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -791,7 +874,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         type: 'object',
         properties: {
           channel: { type: 'string' },
-          limit: { type: 'number', description: 'Max messages (default 20, slack caps at 1000 but practical ceiling is 100).' },
+          limit: { type: 'number', description: 'Max messages (default 20, hard-capped at 100).' },
           thread_ts: { type: 'string', description: 'Optional: fetch replies in this thread instead of channel history.' },
         },
         required: ['channel'],
@@ -808,13 +891,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'download_attachment',
-      description: 'Download files attached to a specific Slack message into the local inbox. Use after fetch_messages shows a message has files (marked with +Nfile). Returns file paths ready to Read. Optionally pass dest_dir to copy files directly to a target directory.',
+      description: 'Download files attached to a specific Slack message into the local inbox. Use after fetch_messages shows a message has files (marked with +Nfile). Returns file paths ready to Read. Optionally pass dest_dir (absolute path; system + plugin-state roots are blocked) to copy files directly to a target directory. Pass thread_ts if the message is a thread reply — slack history excludes thread replies, so that path needs an explicit hint.',
       inputSchema: {
         type: 'object',
         properties: {
           chat_id: { type: 'string' },
           message_id: { type: 'string', description: 'Slack ts of the message whose files you want.' },
-          dest_dir: { type: 'string', description: 'Optional: copy downloaded files to this directory (absolute path).' },
+          dest_dir: { type: 'string', description: 'Optional: copy downloaded files to this directory (absolute path; /etc, /sys, etc. blocked).' },
+          thread_ts: { type: 'string', description: 'Optional: thread root ts. Required when message_id is a thread reply (slack history excludes those).' },
         },
         required: ['chat_id', 'message_id'],
       },
@@ -879,6 +963,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const thread_ts = args.thread_ts as string | undefined
         const files = (args.files as string[] | undefined) ?? []
         await assertChannelAllowed(chat_id)
+        // Length-check before per-file syscalls so a 100-file call doesn't
+        // do 100 stats before rejection.
+        if (files.length > 10) throw new Error('Slack max 10 file attachments per message')
         for (const f of files) {
           assertSendable(f)
           const st = statSync(f)
@@ -886,7 +973,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             throw new Error(`file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB, max 50MB)`)
           }
         }
-        if (files.length > 10) throw new Error('Slack max 10 file attachments per message')
 
         const chunks = chunkOutbound(rawText)
         const sentTs: string[] = []
@@ -1011,7 +1097,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           else who = String(m.bot_id ?? 'unknown')
           const fileCount = Array.isArray(m.files) ? m.files.length : 0
           const filesPart = fileCount > 0 ? ` +${fileCount}file` : ''
-          const tsIso = new Date(parseFloat(String(m.ts)) * 1000).toISOString()
+          const seconds = parseFloat(String(m.ts))
+          const tsIso = Number.isFinite(seconds) ? new Date(seconds * 1000).toISOString() : '?'
           const text = String(m.text ?? '').replace(/[\r\n]+/g, ' ⏎ ')
           return `[${tsIso}] ${who}: ${text}  (ts: ${m.ts}${filesPart})`
         })
@@ -1040,24 +1127,41 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chat_id = args.chat_id as string
         const message_id = args.message_id as string
         const dest_dir = args.dest_dir as string | undefined
+        const thread_ts = args.thread_ts as string | undefined
         await assertChannelAllowed(chat_id)
-        // Slack has no direct "get message by ts" API. `conversations.replies`
-        // with limit=1 returns the THREAD ROOT — wrong if `message_id` is
-        // a reply inside a thread. `conversations.history` with
-        // latest=oldest=ts and inclusive=true is the right shape: returns
-        // exactly the message at that ts regardless of thread context.
-        const r = await app.client.conversations.history({
-          channel: chat_id,
-          latest: message_id,
-          oldest: message_id,
-          inclusive: true,
-          limit: 1,
+        // Slack has no "get one message by ts" API. `conversations.history`
+        // with latest=oldest=ts handles channel-level messages but
+        // *excludes* thread replies (per slack docs: thread replies live
+        // exclusively under conversations.replies). Try history first;
+        // if the caller supplied thread_ts, also try conversations.replies
+        // and find the matching ts in the thread.
+        const fromHistory = await app.client.conversations.history({
+          channel: chat_id, latest: message_id, oldest: message_id, inclusive: true, limit: 1,
         })
-        const m: any = r.messages?.[0]
-        if (!m) throw new Error(`message not found: chat_id=${chat_id} ts=${message_id}`)
+        let m: any = fromHistory.messages?.[0]
+        if (!m && thread_ts) {
+          const fromThread = await app.client.conversations.replies({ channel: chat_id, ts: thread_ts, limit: 200 })
+          m = fromThread.messages?.find((x: any) => x.ts === message_id)
+        }
+        if (!m) {
+          const hint = thread_ts ? '' : ' (if this is a thread reply, pass thread_ts)'
+          throw new Error(`message not found: chat_id=${chat_id} ts=${message_id}${hint}`)
+        }
         const files: any[] = Array.isArray(m.files) ? m.files : []
         if (files.length === 0) return { content: [{ type: 'text', text: 'message has no attachments' }] }
-        if (dest_dir) mkdirSync(dest_dir, { recursive: true })
+        if (dest_dir) {
+          // dest_dir is model-supplied. Require an absolute path and bound it
+          // away from system + plugin-state roots so a confused tool call
+          // can't drop bytes into /etc, the marketplace cache, or our own
+          // access.json directory.
+          if (!dest_dir.startsWith('/')) throw new Error(`dest_dir must be an absolute path (got: ${dest_dir})`)
+          for (const blocked of ['/etc/', '/sys/', '/proc/', '/boot/', '/dev/', STATE_DIR + '/']) {
+            if (dest_dir === blocked.slice(0, -1) || dest_dir.startsWith(blocked)) {
+              throw new Error(`dest_dir is not allowed: ${dest_dir}`)
+            }
+          }
+          mkdirSync(dest_dir, { recursive: true })
+        }
         const lines = await Promise.all(files.map(async f => {
           const url = String(f.url_private_download ?? f.url_private ?? '')
           if (!url) return `  (file ${f.id}: no download URL)`
@@ -1103,7 +1207,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: `voice file uploaded (file ids: ${fileIds})` }] }
       }
       case 'dunk': {
-        const result = applyDunk(args.chat_id as string, 'mcp', args.duration as string | undefined, args.allow_mentions as boolean | undefined)
+        const result = applyDunk(args.chat_id as string, args.duration as string | undefined, args.allow_mentions as boolean | undefined)
         return { content: [{ type: 'text', text: result.msg }], ...(result.ok ? {} : { isError: true }) }
       }
       case 'undunk': {

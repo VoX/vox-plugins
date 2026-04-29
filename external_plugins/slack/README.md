@@ -45,7 +45,7 @@ Tokens** → **Generate Token and Scopes** → name it `socket` → add the
 These are Claude Code commands — run `claude` to start a session first.
 
 ```
-/plugin install slack@claude-plugins-official
+/plugin install slack@vox-plugins
 /reload-plugins
 ```
 

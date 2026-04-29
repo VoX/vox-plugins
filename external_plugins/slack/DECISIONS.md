@@ -10,7 +10,7 @@ Judgement calls made while VoX is away. Review and override at will.
 
 ## Token storage
 
-- Wrote tokens to `~/claude-discord/tinyclaw/.bot.env` per VoX's instruction. Plugin's `server.ts` ALSO loads from `~/.claude/channels/slack/.env` as a fallback (matching the discord plugin pattern), so other deployments without systemd-bot.env can still configure via the per-state-dir env file.
+- `server.ts` reads `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` from process env first (so a systemd `EnvironmentFile=…/.bot.env` works), falling back to `$STATE_DIR/.env` (where `/slack:configure` writes them). State-dir `.env` is chmod 0600 + parsed with quote-stripping so `KEY="value"` lines work the same as in the PreCompact hook.
 
 ## API/SDK choices
 
@@ -28,7 +28,6 @@ Judgement calls made while VoX is away. Review and override at will.
 - **No `claude/channel/permission` relay** — discord plugin sends button-driven permission prompts to allowlisted DMs. Skipped for v0.1; can port from discord if needed.
 - **No slash commands** (`/status`, `/dunk`, `/dedunk` Discord slash). Slack supports them but requires separate `commands` scope + manifest entries + URL endpoint. Skipped for v0.1.
 - **No `/status` command** — port the Haiku-summary `/status` later.
-- ~~**No PreCompact hook**~~ — landed in 0.1.1. `hooks/notify-compact.sh` mirrors the discord hook, posting via `chat.postMessage` (Bearer auth) instead of discord's curl. Token sourced from process env first, falls back to `$STATE_DIR/.env`.
 
 ## Channel notification format
 
@@ -46,35 +45,7 @@ Inbound `<channel>` tag includes `source="slack"`, `team_id`, `chat_id`, `messag
 
 - Capped at 50MB per file (slack's tier-1 limit is much higher, but this matches discord's spirit of "don't fill the inbox"). Adjust upward if you need bigger uploads.
 
-## ⚠️ One blocker: marketplace cache needs a push
-
-The plugin loader looks up `plugin:slack@vox-plugins` in the cached
-marketplace at `~/.claude/plugins/marketplaces/vox-plugins/.claude-plugin/marketplace.json`,
-which is a clone of `https://github.com/VoX/vox-plugins.git`. My
-commits add slack to `marketplace.json` and to `external_plugins/slack/`,
-but they are **local only** — the cached marketplace doesn't see them.
-
-Restarted with `plugin:slack@vox-plugins` in `BOT_PLUGINS`; claude
-silently skipped the plugin (no `bun server.ts` for slack, no error in
-journal — discord + scheduler still loaded fine). Smoke test confirms
-the plugin code itself works.
-
-To actually load slack, the workflow is:
-
-1. `git push origin main` from `~/projects/vox-plugins/`
-2. `claude plugin marketplace update vox-plugins`
-3. `claude plugin install slack@vox-plugins`
-4. Restart `claude-discord@tinyclaw`
-
-Step 1 is unauthorized for me (push to public repo without explicit
-ask). Holding for VoX to either push themselves or authorize.
-
-Workaround if you want to test before pushing: temporarily change the
-marketplace source to `file:///home/ec2-user/projects/vox-plugins`
-in `~/.claude/plugins/known_marketplaces.json`, run
-`marketplace update`, install, restart. Revert when done.
-
-## Deferred from the 0.1.7 4-agent review
+## Deferred from the 4-agent review rounds
 
 Substantive findings that fix would have meaningfully changed scope or
 required bigger refactors. Documented here so they're not lost:
