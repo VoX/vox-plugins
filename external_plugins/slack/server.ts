@@ -55,7 +55,7 @@ import {
 // respond, but with zero tools, no .env load, no Socket Mode connection,
 // no traffic at all.
 if (process.env.VOX_PLUGINS_ENABLED !== '1') {
-  const idle = new Server({ name: 'slack', version: '0.1.0' }, { capabilities: { tools: {} } })
+  const idle = new Server({ name: 'slack', version: '0.1.1' }, { capabilities: { tools: {} } })
   idle.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
   await idle.connect(new StdioServerTransport())
   await new Promise<never>(() => {})
@@ -288,6 +288,13 @@ const app = new App({
   appToken: SLACK_APP_TOKEN,
   socketMode: true,
   logLevel: (process.env.SLACK_BOLT_LOG_LEVEL as any) ?? undefined,
+})
+
+// Bolt swallows event handler errors silently by default. Surface them
+// so systemd's stderr capture sees the cause instead of just a missing
+// reply. process.on('unhandledRejection') above covers the rest.
+app.error(async err => {
+  process.stderr.write(`slack channel: bolt error: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`)
 })
 
 // auth.test gives us our own user id + workspace id at startup. Cache
@@ -652,7 +659,7 @@ app.event('message', async ({ event }) => {
 
 // --- MCP server ---
 const mcp = new Server(
-  { name: 'slack', version: '0.1.0' },
+  { name: 'slack', version: '0.1.1' },
   {
     capabilities: {
       tools: {},

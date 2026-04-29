@@ -28,7 +28,7 @@ Judgement calls made while VoX is away. Review and override at will.
 - **No `claude/channel/permission` relay** — discord plugin sends button-driven permission prompts to allowlisted DMs. Skipped for v0.1; can port from discord if needed.
 - **No slash commands** (`/status`, `/dunk`, `/dedunk` Discord slash). Slack supports them but requires separate `commands` scope + manifest entries + URL endpoint. Skipped for v0.1.
 - **No `/status` command** — port the Haiku-summary `/status` later.
-- **No PreCompact hook** — `notify-compact.sh` from discord posts a "context compacting" message. Easy port (substitute `chat.postMessage` for the discord curl). Punted for v0.1.
+- ~~**No PreCompact hook**~~ — landed in 0.1.1. `hooks/notify-compact.sh` mirrors the discord hook, posting via `chat.postMessage` (Bearer auth) instead of discord's curl. Token sourced from process env first, falls back to `$STATE_DIR/.env`.
 
 ## Channel notification format
 
@@ -50,5 +50,4 @@ Inbound `<channel>` tag includes `source="slack"`, `team_id`, `chat_id`, `messag
 
 - Port discord plugin's permission relay to slack (Block Kit actions buttons can drive the same flow).
 - Port `/status` slash command (would also need slash command scope + manifest entry).
-- Port PreCompact hook (notify-compact.sh slack version).
 - Bolt's reconnect/watchdog story — Bolt handles reconnects internally but a watchdog timer matching the discord plugin's pattern (kill on prolonged disconnect, let systemd restart) might still be valuable. Not added in v0.1.
