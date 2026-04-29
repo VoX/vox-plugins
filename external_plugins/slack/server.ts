@@ -18,7 +18,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { App } from '@slack/bolt'
+import { App, LogLevel } from '@slack/bolt'
 
 // Bolt's message-event union is wide (~20 subtypes). We only deliver
 // plain user messages; this is the minimal shape for that case, narrowed
@@ -47,6 +47,7 @@ import {
   chunk,
   isDmChannel,
   normalizeReactionName,
+  slackTsToIso,
 } from './lib'
 
 // Opt-in gate. Plugin is inert unless VOX_PLUGINS_ENABLED=1 — only our
@@ -54,7 +55,7 @@ import {
 // respond, but with zero tools, no .env load, no Socket Mode connection,
 // no traffic at all.
 if (process.env.VOX_PLUGINS_ENABLED !== '1') {
-  const idle = new Server({ name: 'slack', version: '0.1.10' }, { capabilities: { tools: {} } })
+  const idle = new Server({ name: 'slack', version: '0.1.11' }, { capabilities: { tools: {} } })
   idle.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
   await idle.connect(new StdioServerTransport())
   // Idle path needs SIGTERM/stdin-EOF handlers too — without them
@@ -76,9 +77,8 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
 const DUNKED_FILE = join(STATE_DIR, 'dunked.json')
 const USERNAME_CACHE_FILE = join(STATE_DIR, 'username-cache.json')
 
-// `mkdirSync({mode})` is a no-op on existing dirs — chmod afterwards so
-// dirs created by an earlier run with a wider umask get tightened back
-// to owner-only.
+// mkdirSync's `mode` is a no-op on existing dirs — chmod after so a
+// pre-existing dir with wider perms gets tightened.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
 try { chmodSync(STATE_DIR, 0o700) } catch {}
@@ -420,7 +420,7 @@ const app = new App({
   token: SLACK_BOT_TOKEN,
   appToken: SLACK_APP_TOKEN,
   socketMode: true,
-  logLevel: (process.env.SLACK_BOLT_LOG_LEVEL as any) ?? undefined,
+  logLevel: process.env.SLACK_BOLT_LOG_LEVEL as LogLevel | undefined,
 })
 
 // Bolt swallows event handler errors silently by default. Surface them
@@ -439,8 +439,8 @@ app.event('user_change', async ({ event }) => {
   await refreshBotHandle()
 })
 
-// auth.test gives us our own user id + workspace id at startup. Cache
-// these — gate() consults botUserId for mention detection.
+// auth.test populates these once at boot; gate()/isMentioned()/the
+// self-loop guard all read them.
 let BOT_USER_ID = ''
 let TEAM_ID = ''
 let BOT_HANDLE = ''
@@ -457,10 +457,8 @@ async function loadSelf(): Promise<void> {
   TEAM_ID = (auth.team_id as string) ?? ''
   BOT_HANDLE = (auth.user as string) ?? ''
   if (!BOT_USER_ID) {
-    // Empty BOT_USER_ID makes the mention check `text.includes("<@>")` match
-    // any string with a literal `<@>` (false positives) and breaks the
-    // self-loop guard `msg.user === BOT_USER_ID`. Fail boot rather than
-    // run with broken identity.
+    // Empty BOT_USER_ID makes `text.includes("<@>")` match anything and
+    // breaks the self-loop guard. Fail boot rather than run blind.
     throw new Error(`slack auth.test returned no user_id; cannot start without bot identity`)
   }
   rebuildBotHandleMention()
@@ -539,17 +537,15 @@ type GateResult =
 
 async function gate(event: SlackUserMessageEvent): Promise<GateResult> {
   const senderId = event.user
-  const channelType = event.channel_type  // 'channel' | 'group' | 'im' | 'mpim'
   if (!senderId) return { action: 'drop' }
 
-  if (channelType === 'im') {
+  if (event.channel_type === 'im') {
     return withAccessLock((): GateResult => {
       const access = loadAccess()
       if (pruneExpired(access)) saveAccess(access)
       if (access.dmPolicy === 'disabled') return { action: 'drop' }
       if (access.allowFrom.includes(senderId)) return { action: 'deliver', access }
       if (access.dmPolicy === 'allowlist') return { action: 'drop' }
-      // pairing — existing pending?
       for (const [code, p] of Object.entries(access.pending)) {
         if (p.senderId === senderId) {
           if ((p.replies ?? 1) >= 2) return { action: 'drop' }
@@ -558,17 +554,9 @@ async function gate(event: SlackUserMessageEvent): Promise<GateResult> {
           return { action: 'pair', code, isResend: true }
         }
       }
-      // Per-sender cap (one pending at a time per slack user). The
-      // earlier global-of-3 cap was DoS'able: three concurrent unknown
-      // senders could fill the table and block legitimate fourth users
-      // silently. Per-sender means each sender has independent quota,
-      // and the existing pending-loop above already returned an early
-      // 'pair'/`isResend:true` when this user already has an entry —
-      // so reaching this line means there's NO existing pending for
-      // this senderId and we're safe to issue one.
-      // Sender's previous pending entry expired recently — don't issue
-      // a fresh code yet. Prevents code-churning by waiting out the 1h
-      // expiry then DM'ing for a brand-new code.
+      // 5-min cooldown after a pending entry expires. The pending-loop
+      // above is the per-sender cap — one pending per sender — so by
+      // this point we know this sender has none.
       if (isInPairingCooldown(senderId)) return { action: 'drop' }
       const code = randomBytes(4).toString('hex')
       const now = Date.now()
@@ -724,6 +712,33 @@ function safeFileName(name: string): string {
   return name.replace(/[\[\]\r\n;]/g, '_')
 }
 
+// Inbound + download_attachment both render slack file metadata as
+// "name (mimetype, kbKB)". Single source of truth so the two views
+// don't drift.
+function formatSlackFileMeta(f: { name?: unknown; id?: unknown; mimetype?: unknown; size?: unknown }): string {
+  const name = safeFileName(String(f.name ?? f.id ?? 'file'))
+  const kb = (Number(f.size ?? 0) / 1024).toFixed(0)
+  return `${name} (${f.mimetype ?? 'unknown'}, ${kb}KB)`
+}
+
+// Validate a local file path before uploading to slack. Throws on
+// inbox-escape (assertSendable), 0 bytes (slack accepts but renders
+// as a broken file), oversize. Returns size for downstream use.
+function assertUploadable(path: string): number {
+  assertSendable(path)
+  const st = statSync(path)
+  if (st.size === 0) throw new Error(`file is empty: ${path}`)
+  if (st.size > MAX_ATTACHMENT_BYTES) {
+    throw new Error(`file too large: ${path} (${(st.size / 1024 / 1024).toFixed(1)}MB, max ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB)`)
+  }
+  return st.size
+}
+
+// Filesystem roots dest_dir is forbidden from writing into. Module-level
+// const so the test surface (and any future cross-tool dest_dir flag)
+// has one source of truth.
+const BLOCKED_DEST_PREFIXES = ['/etc/', '/sys/', '/proc/', '/boot/', '/dev/'] as const
+
 // Slack file urls (url_private_download) require a Bearer token to GET.
 // Hostnames Slack legitimately serves file content from. A crafted file
 // event with `url_private_download` pointing off-host would otherwise
@@ -782,19 +797,24 @@ async function annotateMentions(text: string): Promise<string> {
       } catch {}
     }),
   ])
-  let out = text
-  const replaced = new Set<string>()
+  // Build a `raw → annotated` lookup, then sub all mentions in one pass.
+  // `replaceAll` per token would re-scan the full string per mention —
+  // O(N·len). Single regex is O(len).
+  const subs = new Map<string, string>()
   for (const m of mentions) {
-    if (replaced.has(m.raw)) continue
-    replaced.add(m.raw)
+    if (subs.has(m.raw)) continue
     if (m.type === 'user' || m.type === 'channel') {
       const name = usernameCache.get(m.id)
-      if (name) out = out.replaceAll(m.raw, `${m.raw} (${name})`)
+      if (name) subs.set(m.raw, `${m.raw} (${name})`)
     } else if (m.type === 'usergroup' && m.handle) {
-      out = out.replaceAll(m.raw, `${m.raw} (${m.handle})`)
+      subs.set(m.raw, `${m.raw} (${m.handle})`)
     }
   }
-  return out
+  if (subs.size === 0) return text
+  // Escape each raw form and join into one alternation. parseSlackMentions
+  // only emits a fixed set of mention shapes so the alternation is bounded.
+  const re = new RegExp([...subs.keys()].map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'g')
+  return text.replace(re, raw => subs.get(raw) ?? raw)
 }
 
 // --- Inbound message handling ---
@@ -824,11 +844,8 @@ app.event('message', async ({ event }) => {
     }
     return
   }
-  // Drop messages from sister workspaces in an Enterprise Grid setup.
-  // BOT_USER_ID is workspace-scoped — gate semantics + outbound replies
-  // would race in confusing ways for cross-team events. Single-workspace
-  // is a documented v0.1 constraint; if/when multi-team support lands,
-  // this guard becomes a per-team config check instead.
+  // Drop sister-workspace events in Enterprise Grid setups —
+  // single-workspace is a documented v0.1 constraint.
   const eventTeam = (event as { team?: string }).team
   if (eventTeam && eventTeam !== TEAM_ID) {
     process.stderr.write(`slack channel: dropping cross-team event (event.team=${eventTeam}, our team=${TEAM_ID})\n`)
@@ -888,46 +905,37 @@ app.event('message', async ({ event }) => {
   const files = msg.files
   const atts: string[] = []
   if (Array.isArray(files)) {
-    for (const f of files) {
-      const kb = (Number(f.size ?? 0) / 1024).toFixed(0)
-      atts.push(`${safeFileName(String(f.name ?? f.id ?? 'file'))} (${f.mimetype ?? 'unknown'}, ${kb}KB)`)
-    }
+    for (const f of files) atts.push(formatSlackFileMeta(f))
   }
 
-  // Resolve mentions in body + sender display name in parallel — independent.
+  // Body annotation, sender display-name lookup, and thread-root fetch
+  // are all independent — fan them out together so the inbound→Claude
+  // latency is one RTT instead of two-or-three.
   const rawText = msg.text ?? (atts.length > 0 ? '(attachment)' : '')
-  const [content, user] = await Promise.all([
+  const fetchThreadRoot = msg.thread_ts && msg.thread_ts !== msg.ts
+    ? app.client.conversations.replies({ channel: msg.channel, ts: msg.thread_ts, limit: 1 }).catch(() => null)
+    : Promise.resolve(null)
+  const [content, user, root] = await Promise.all([
     annotateMentions(rawText),
     resolveDisplayName(msg.user),
+    fetchThreadRoot,
   ])
-  // Slack ts is `seconds.microseconds` as a string. Malformed input
-  // would propagate as `NaN` through Date and toISOString() throws.
-  const parsedSeconds = parseFloat(msg.ts)
-  const tsIso = Number.isFinite(parsedSeconds)
-    ? new Date(parsedSeconds * 1000).toISOString()
-    : new Date().toISOString()
+  const tsIso = slackTsToIso(msg.ts)
 
-  // Thread context: if msg is a reply in a thread, fetch the root for context.
   let replyMeta: Record<string, string> = {}
-  if (msg.thread_ts && msg.thread_ts !== msg.ts) {
-    try {
-      const root = await app.client.conversations.replies({
-        channel: msg.channel,
-        ts: msg.thread_ts,
-        limit: 1,
-      })
-      const r = root.messages?.[0]
-      if (r) {
-        const rUser = r.user
-          ? await resolveDisplayName(String(r.user))
-          : String(r.bot_id ?? 'unknown')
-        replyMeta = {
-          reply_to: String(r.ts ?? msg.thread_ts),
-          reply_to_author: rUser,
-          reply_to_content: await annotateMentions(safeSlice(String(r.text ?? ''), 200)),
-        }
-      }
-    } catch {}
+  const r = root?.messages?.[0]
+  if (r) {
+    // Inside the thread-root path, root-author resolve + root-text
+    // annotate are also independent — fold into one Promise.all.
+    const [rUser, rContent] = await Promise.all([
+      r.user ? resolveDisplayName(String(r.user)) : Promise.resolve(String(r.bot_id ?? 'unknown')),
+      annotateMentions(safeSlice(String(r.text ?? ''), 200)),
+    ])
+    replyMeta = {
+      reply_to: String(r.ts ?? msg.thread_ts),
+      reply_to_author: rUser,
+      reply_to_content: rContent,
+    }
   }
 
   void mcp.notification({
@@ -954,7 +962,7 @@ app.event('message', async ({ event }) => {
 
 // --- MCP server ---
 const mcp = new Server(
-  { name: 'slack', version: '0.1.10' },
+  { name: 'slack', version: '0.1.11' },
   {
     capabilities: {
       tools: {},
@@ -1127,14 +1135,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // Length-check before per-file syscalls so a 100-file call doesn't
         // do 100 stats before rejection.
         if (files.length > 10) throw new Error('Slack max 10 file attachments per message')
-        for (const f of files) {
-          assertSendable(f)
-          const st = statSync(f)
-          if (st.size === 0) throw new Error(`file is empty: ${f}`)
-          if (st.size > MAX_ATTACHMENT_BYTES) {
-            throw new Error(`file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB, max 50MB)`)
-          }
-        }
+        for (const f of files) assertUploadable(f)
 
         const chunks = chunkOutbound(rawText)
         const sentTs: string[] = []
@@ -1268,8 +1269,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           else who = String(m.bot_id ?? 'unknown')
           const fileCount = Array.isArray(m.files) ? m.files.length : 0
           const filesPart = fileCount > 0 ? ` +${fileCount}file` : ''
-          const seconds = parseFloat(String(m.ts))
-          const tsIso = Number.isFinite(seconds) ? new Date(seconds * 1000).toISOString() : '?'
+          const tsIso = slackTsToIso(String(m.ts), '?')
           const text = String(m.text ?? '').replace(/[\r\n]+/g, ' ⏎ ')
           return `[${tsIso}] ${who}: ${text}  (ts: ${m.ts}${filesPart})`
         })
@@ -1326,7 +1326,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           // can't drop bytes into /etc, the marketplace cache, or our own
           // access.json directory.
           if (!dest_dir.startsWith('/')) throw new Error(`dest_dir must be an absolute path (got: ${dest_dir})`)
-          for (const blocked of ['/etc/', '/sys/', '/proc/', '/boot/', '/dev/', STATE_DIR + '/']) {
+          for (const blocked of [...BLOCKED_DEST_PREFIXES, STATE_DIR + '/']) {
             if (dest_dir === blocked.slice(0, -1) || dest_dir.startsWith(blocked)) {
               throw new Error(`dest_dir is not allowed: ${dest_dir}`)
             }
@@ -1343,8 +1343,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             copyFileSync(path, destPath)
             finalPath = destPath
           }
-          const kb = ((f.size ?? 0) / 1024).toFixed(0)
-          return `  ${finalPath}  (${safeFileName(String(f.name ?? f.id))}, ${f.mimetype ?? 'unknown'}, ${kb}KB)`
+          return `  ${finalPath}  (${formatSlackFileMeta(f)})`
         }))
         return { content: [{ type: 'text', text: `downloaded ${lines.length} file(s):\n${lines.join('\n')}` }] }
       }
@@ -1366,16 +1365,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const file = args.file as string
         const thread_ts = args.thread_ts as string | undefined
         await assertChannelAllowed(chat_id)
-        assertSendable(file)
         // Tool description says ogg/Opus; reject anything else so a
         // misnamed wav doesn't upload as a generic attachment that
         // doesn't render as audio.
         if (!/\.(ogg|opus)$/i.test(file)) {
           throw new Error(`send_voice_message expects .ogg/.opus (got: ${file})`)
         }
-        const st = statSync(file)
-        if (st.size === 0) throw new Error(`file is empty: ${file}`)
-        if (st.size > MAX_ATTACHMENT_BYTES) throw new Error(`file too large: ${file} (${(st.size / 1024 / 1024).toFixed(1)}MB)`)
+        assertUploadable(file)
         // files.uploadV2's discriminated union types make conditional
         // thread_ts inclusion awkward to type. Cast through `unknown`
         // since the runtime contract is exact.

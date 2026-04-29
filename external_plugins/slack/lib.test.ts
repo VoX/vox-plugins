@@ -8,6 +8,7 @@ import {
   chunk,
   isDmChannel,
   normalizeReactionName,
+  slackTsToIso,
 } from './lib'
 
 describe('safeSlice', () => {
@@ -185,6 +186,22 @@ describe('chunk', () => {
       expect(() => JSON.parse(JSON.stringify(piece))).not.toThrow()
     }
     expect(out.join('')).toBe('🦝🦝🦝🦝🦝')
+  })
+})
+
+describe('slackTsToIso', () => {
+  test('converts seconds.microseconds to ISO', () => {
+    // 1777494189.463109 = ~ 2026-04-29T20:23:09.463Z
+    expect(slackTsToIso('1777494189.463109')).toBe('2026-04-29T20:23:09.463Z')
+  })
+  test('falls back on malformed ts', () => {
+    expect(slackTsToIso('garbage', '2025-01-01T00:00:00Z')).toBe('2025-01-01T00:00:00Z')
+  })
+  test('falls back on empty', () => {
+    expect(slackTsToIso('', '?')).toBe('?')
+  })
+  test('default fallback is "now-ish" — finite ISO', () => {
+    expect(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/.test(slackTsToIso('garbage'))).toBe(true)
   })
 })
 

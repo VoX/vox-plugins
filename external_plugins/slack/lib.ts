@@ -1,6 +1,6 @@
 // Pure helpers used by server.ts. Kept in their own file so they can be
-// unit-tested without booting the full MCP server (which connects to
-// Slack on import).
+// unit-tested without booting the full MCP server (which dials Slack via
+// Socket Mode in `app.start()`).
 
 // JS string `.slice(0, N)` operates on UTF-16 code units. Multi-codepoint
 // emoji (any character outside the BMP — e.g. 🦝, 🫡, 🐧) take TWO code
@@ -131,11 +131,8 @@ export function parseSlackMentions(text: string): SlackMention[] {
 // breaks > hard-cut at limit. Slack's per-message text cap is ~40K chars
 // but blocks have a 3000-char per-section limit; default to 3000.
 //
-// Emoji safety: hard-cut at the codepoint boundary, not the UTF-16 unit
-// boundary. `slice(0, n)` would strand a lone surrogate inside any
-// non-BMP emoji (🦝, 🫡, etc.) → JSON encodes as `\ud83e` and Anthropic's
-// parser rejects the resulting message with HTTP 400. Same class of bug
-// `safeSlice` guards above; `chunk` had it open until 0.1.7.
+// Hard-cut path lands on a codepoint boundary, not a UTF-16 unit boundary
+// — see `safeSlice` for the surrogate-pair rationale.
 export function chunk(text: string, limit: number): string[] {
   if (text.length <= limit) return [text]
   const out: string[] = []
@@ -165,6 +162,14 @@ export function chunk(text: string, limit: number): string[] {
 // DM case needs to fall through to the user-id allowlist check.
 export function isDmChannel(id: string): boolean {
   return id.startsWith('D')
+}
+
+// Slack `ts` is `seconds.microseconds` as a string. Returns ISO-8601 or
+// the fallback (default: now) on malformed input — `parseFloat('garbage')`
+// would otherwise propagate through Date and `.toISOString()` would throw.
+export function slackTsToIso(ts: string, fallback: string = new Date().toISOString()): string {
+  const seconds = parseFloat(ts)
+  return Number.isFinite(seconds) ? new Date(seconds * 1000).toISOString() : fallback
 }
 
 // Reactions in slack are referenced by shortcode (e.g. "thumbsup"), not
