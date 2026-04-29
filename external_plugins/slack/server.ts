@@ -46,7 +46,7 @@ import {
   mdToMrkdwn,
   parseSlackMentions,
   chunk,
-  classifySlackChannel,
+  isDmChannel,
   normalizeReactionName,
 } from './lib'
 
@@ -415,10 +415,9 @@ if (!STATIC) setInterval(checkApprovals, 5000).unref()
 // Outbound gate — tools can only target chats the inbound gate allows.
 async function assertChannelAllowed(chatId: string): Promise<void> {
   const access = loadAccess()
-  const kind = classifySlackChannel(chatId)
-  if (kind === 'im') {
+  if (isDmChannel(chatId)) {
     const info = await app.client.conversations.info({ channel: chatId })
-    const userId = (info.channel as any)?.user as string | undefined
+    const userId = (info.channel as { user?: string } | undefined)?.user
     if (userId && access.allowFrom.includes(userId)) return
     throw new Error(`channel ${chatId} (DM) is not allowlisted — add via /slack:access`)
   }

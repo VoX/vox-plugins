@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "vox-plugins",
-  "description": "VoX's fork of Claude Code plugins. Currently: discord (messaging channel with access control) and scheduler (deliver messages to your future self).",
+  "description": "VoX's fork of Claude Code plugins. Currently: discord + slack (messaging channels with access control) and scheduler (deliver messages to your future self).",
   "owner": {
     "name": "VoX",
     "email": "vox@bitvox.me"
@@ -12,6 +12,12 @@
       "description": "Discord messaging bridge with built-in access control. Manage pairing, allowlists, and policy via /discord:access.",
       "category": "productivity",
       "source": "./external_plugins/discord"
+    },
+    {
+      "name": "slack",
+      "description": "Slack messaging bridge via Socket Mode (no public URL needed). Mirrors the discord plugin's surface. Manage access via /slack:access.",
+      "category": "productivity",
+      "source": "./external_plugins/slack"
     },
     {
       "name": "scheduler",

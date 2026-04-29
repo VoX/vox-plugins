@@ -6,7 +6,7 @@ import {
   mdToMrkdwn,
   parseSlackMentions,
   chunk,
-  classifySlackChannel,
+  isDmChannel,
   normalizeReactionName,
 } from './lib'
 
@@ -140,18 +140,21 @@ describe('chunk', () => {
   })
 })
 
-describe('classifySlackChannel', () => {
-  test('public channel C-prefix', () => {
-    expect(classifySlackChannel('C12345')).toBe('public')
+describe('isDmChannel', () => {
+  test('D-prefix is a DM', () => {
+    expect(isDmChannel('D12345')).toBe(true)
   })
-  test('private/legacy G-prefix', () => {
-    expect(classifySlackChannel('G12345')).toBe('private')
+  test('C-prefix is not a DM', () => {
+    expect(isDmChannel('C12345')).toBe(false)
   })
-  test('DM D-prefix', () => {
-    expect(classifySlackChannel('D12345')).toBe('im')
+  test('G-prefix is not a DM (private channel)', () => {
+    expect(isDmChannel('G12345')).toBe(false)
   })
-  test('unknown prefix', () => {
-    expect(classifySlackChannel('X12345')).toBe('unknown')
+  test('MPDM-prefix is not a DM (group DM)', () => {
+    expect(isDmChannel('MPDM01234')).toBe(false)
+  })
+  test('empty string is not a DM', () => {
+    expect(isDmChannel('')).toBe(false)
   })
 })
 

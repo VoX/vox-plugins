@@ -124,15 +124,15 @@ export function chunk(text: string, limit: number): string[] {
   return out
 }
 
-// Slack channel IDs follow a fixed prefix scheme — useful for routing
-// log lines and validating tool args before round-tripping to the API.
-export type SlackChannelKind = 'public' | 'private' | 'im' | 'mpim' | 'unknown'
-export function classifySlackChannel(id: string): SlackChannelKind {
-  if (id.startsWith('C')) return 'public'
-  if (id.startsWith('G')) return 'private' // legacy private channels still exist
-  if (id.startsWith('D')) return 'im'
-  if (id.startsWith('MPDM') || id.startsWith('G0') === false && id.startsWith('G') ? false : false) return 'mpim'
-  return 'unknown'
+// Slack 1:1 DM channel IDs always start with 'D'. Public (C), private
+// (G), and multi-party DMs (MPDM…/G…) all behave the same way for our
+// access gate — opted into per-channel via `groups` — so we only need
+// to single out the DM case for the user-id allowlist lookup. Earlier
+// drafts had a fuller classifier; the operator-precedence bug there
+// (and the lack of any callsite using anything beyond 'im' vs not)
+// pointed straight at this minimal shape.
+export function isDmChannel(id: string): boolean {
+  return id.startsWith('D')
 }
 
 // Reactions in slack are referenced by shortcode (e.g. "thumbsup"), not
