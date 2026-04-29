@@ -48,17 +48,29 @@ export function parseDuration(input: string): number | null {
 // markdown without thinking about Slack's quirks. Code blocks, inline
 // code, blockquotes, and links are already compatible.
 export function mdToMrkdwn(text: string): string {
-  // Replace **bold** → *bold*. Use a non-greedy match so adjacent runs
-  // don't merge. Avoid touching escaped `\*\*` (uncommon, but cheap to
-  // preserve).
+  // Split on fenced code blocks first; odd-index parts ARE the code
+  // (preserved as-is), even-index parts are prose (transformed). Then
+  // within each prose segment split on inline backticks for the same
+  // reason — we don't want to convert `**foo**` literals inside code
+  // examples that claude often emits.
+  const fenceParts = text.split(/(```[\s\S]*?```)/g)
+  return fenceParts.map((part, i) => {
+    if (i % 2 === 1) return part
+    const inlineParts = part.split(/(`[^`\n]+`)/g)
+    return inlineParts.map((p, j) => {
+      if (j % 2 === 1) return p
+      return transformProse(p)
+    }).join('')
+  }).join('')
+}
+
+function transformProse(text: string): string {
+  // **bold** → *bold*. Non-greedy, escape-aware.
   let out = text.replace(/(?<!\\)\*\*([^*\n]+?)\*\*/g, '*$1*')
-  // Replace ~~strike~~ → ~strike~. Same non-greedy + escape guard.
+  // ~~strike~~ → ~strike~. Same shape.
   out = out.replace(/(?<!\\)~~([^~\n]+?)~~/g, '~$1~')
-  // Single-asterisk italic (*italic*) → underscore italic (_italic_) is
-  // ambiguous: bold also uses *…*. We only convert _italic_ in the
-  // markdown direction, since slack's mrkdwn already handles _ for
-  // italic. Leaving asterisk runs alone is the safer choice.
-  // Markdown links [text](url) → slack <url|text>
+  // [text](url) → <url|text>. Skip single-asterisk italic conversion —
+  // ambiguous with bold leftovers and slack's mrkdwn already handles _.
   out = out.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<$2|$1>')
   return out
 }

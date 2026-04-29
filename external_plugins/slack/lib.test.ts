@@ -82,6 +82,20 @@ describe('mdToMrkdwn', () => {
   test('preserves backticks and code blocks', () => {
     expect(mdToMrkdwn('`x` and ```y```')).toBe('`x` and ```y```')
   })
+  test('does not convert markdown inside fenced code blocks', () => {
+    const input = 'see this code:\n```\nconst x = "**not bold**"\n```\nand normal **bold**'
+    const out = mdToMrkdwn(input)
+    expect(out).toContain('"**not bold**"')  // untouched
+    expect(out).toContain('and normal *bold*')  // converted
+  })
+  test('does not convert markdown inside inline backticks', () => {
+    expect(mdToMrkdwn('use `**foo**` for bold, but **bar** is bold'))
+      .toBe('use `**foo**` for bold, but *bar* is bold')
+  })
+  test('does not convert link syntax inside code blocks', () => {
+    expect(mdToMrkdwn('```\n[link](http://x)\n```'))
+      .toBe('```\n[link](http://x)\n```')
+  })
 })
 
 describe('parseSlackMentions', () => {
