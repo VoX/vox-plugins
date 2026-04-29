@@ -54,9 +54,16 @@ import {
 // respond, but with zero tools, no .env load, no Socket Mode connection,
 // no traffic at all.
 if (process.env.VOX_PLUGINS_ENABLED !== '1') {
-  const idle = new Server({ name: 'slack', version: '0.1.8' }, { capabilities: { tools: {} } })
+  const idle = new Server({ name: 'slack', version: '0.1.9' }, { capabilities: { tools: {} } })
   idle.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
   await idle.connect(new StdioServerTransport())
+  // Idle path needs SIGTERM/stdin-EOF handlers too — without them
+  // systemd has to wait for TimeoutStopSec then SIGKILL.
+  const idleExit = () => process.exit(0)
+  process.on('SIGTERM', idleExit)
+  process.on('SIGINT', idleExit)
+  process.stdin.on('end', idleExit)
+  process.stdin.on('close', idleExit)
   await new Promise<never>(() => {})
 }
 
@@ -69,8 +76,13 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
 const DUNKED_FILE = join(STATE_DIR, 'dunked.json')
 const USERNAME_CACHE_FILE = join(STATE_DIR, 'username-cache.json')
 
+// `mkdirSync({mode})` is a no-op on existing dirs — chmod afterwards so
+// dirs created by an earlier run with a wider umask get tightened back
+// to owner-only.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
+try { chmodSync(STATE_DIR, 0o700) } catch {}
+try { chmodSync(INBOX_DIR, 0o700) } catch {}
 
 // Load state-dir .env into process.env. Real env wins so a systemd-unit
 // EnvironmentFile (e.g. `.bot.env`) supersedes the per-state file.
@@ -134,7 +146,8 @@ function saveUsernameCache(): void {
     process.stderr.write(`slack: username cache save failed: ${e}\n`)
   }
 }
-setInterval(saveUsernameCache, 30_000).unref()
+const usernameCacheSaveTimer = setInterval(saveUsernameCache, 30_000)
+usernameCacheSaveTimer.unref()
 
 function cacheUsername(id: string, name: string): void {
   if (usernameCache.get(id) === name) return
@@ -255,8 +268,28 @@ const MAX_IMAGE_BYTES = 5 * 1024 * 1024
 function chunkOutbound(text: string): string[] {
   const access = loadAccess()
   const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, HARD_CHUNK_CEILING))
-  return chunk(mdToMrkdwn(text), limit)
+  return chunk(mdToMrkdwn(text), limit).map(escapeSlashPrefix)
 }
+
+// Slack treats `/`-prefixed messages as slash-command attempts and bots
+// can't post them — `chat.postMessage` returns `slash_commands_not_allowed_for_bots`
+// even when the rest of the message is benign prose. Prefix a zero-width
+// space so the visible text reads identically but the dispatcher
+// doesn't see the leading slash.
+function escapeSlashPrefix(s: string): string {
+  return s.startsWith('/') ? '​' + s : s
+}
+
+// Default args for any chat.postMessage call we make. unfurl_links /
+// unfurl_media off keeps bot replies tight (no wikipedia preview cards
+// stapled to one-line acks). link_names: false prevents accidental
+// `@here`/`@channel` interpretation when the bot echoes user prose
+// containing a literal `@` followed by a workspace handle.
+const POST_MESSAGE_DEFAULTS = {
+  unfurl_links: false,
+  unfurl_media: false,
+  link_names: false,
+} as const
 
 function readAccessFile(): Access {
   try {
@@ -292,6 +325,10 @@ const BOOT_ACCESS: Access | null = STATIC
 function loadAccess(): Access { return BOOT_ACCESS ?? readAccessFile() }
 function saveAccess(a: Access): void {
   if (STATIC) return
+  // Throws on disk-full / permission-denied — caller is responsible for
+  // rolling back any in-memory mutations they made before this call.
+  // gate()'s pairing branch handles this rollback so a write failure
+  // doesn't leave the in-memory access ahead of disk.
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
   const tmp = ACCESS_FILE + '.tmp'
   writeFileSync(tmp, JSON.stringify(a, null, 2) + '\n', { mode: 0o600 })
@@ -307,18 +344,44 @@ function withAccessLock<T>(fn: () => Promise<T> | T): Promise<T> {
   return next
 }
 
+// Cooldown ledger keyed by senderId. When a sender's pending entry
+// expires (replies cap reached + an hour passes, or operator-deny),
+// we record it here so the next inbound from the same sender doesn't
+// instantly get a fresh code. Without this a sender who's been
+// silently rate-limited can churn through codes by waiting an hour
+// each time.
+const PAIRING_COOLDOWN_MS = 5 * 60 * 1000
+const recentlyExpiredSenders = new Map<string, number>()
+
 function pruneExpired(a: Access): boolean {
-  // Hot path: every inbound message hits this. Empty pending is the
-  // common case once a workspace is paired — short-circuit to avoid
-  // walking an empty map.
   const codes = Object.keys(a.pending)
   if (codes.length === 0) return false
   const now = Date.now()
   let changed = false
   for (const code of codes) {
-    if (a.pending[code]!.expiresAt < now) { delete a.pending[code]; changed = true }
+    const entry = a.pending[code]!
+    if (entry.expiresAt < now) {
+      recentlyExpiredSenders.set(entry.senderId, now)
+      delete a.pending[code]
+      changed = true
+    }
+  }
+  // Sweep the cooldown map opportunistically — keeps it bounded with
+  // no extra timer plumbing.
+  for (const [sender, expiredAt] of recentlyExpiredSenders) {
+    if (now - expiredAt > PAIRING_COOLDOWN_MS) recentlyExpiredSenders.delete(sender)
   }
   return changed
+}
+
+function isInPairingCooldown(senderId: string): boolean {
+  const at = recentlyExpiredSenders.get(senderId)
+  if (at === undefined) return false
+  if (Date.now() - at > PAIRING_COOLDOWN_MS) {
+    recentlyExpiredSenders.delete(senderId)
+    return false
+  }
+  return true
 }
 
 // Track ts of messages we recently sent so reply-to-bot in channels
@@ -373,7 +436,14 @@ let BOT_USER_ID = ''
 let TEAM_ID = ''
 let BOT_HANDLE = ''
 async function loadSelf(): Promise<void> {
-  const auth = await app.client.auth.test({ token: SLACK_BOT_TOKEN })
+  // 10s timeout — a stuck handshake would otherwise hold boot forever
+  // until systemd's TimeoutStartSec fires.
+  const auth = await Promise.race([
+    app.client.auth.test({ token: SLACK_BOT_TOKEN }),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('auth.test timed out after 10s')), 10_000),
+    ),
+  ])
   BOT_USER_ID = (auth.user_id as string) ?? ''
   TEAM_ID = (auth.team_id as string) ?? ''
   BOT_HANDLE = (auth.user as string) ?? ''
@@ -444,6 +514,11 @@ async function gate(event: SlackUserMessageEvent): Promise<GateResult> {
         }
       }
       if (Object.keys(access.pending).length >= 3) return { action: 'drop' }
+      // Sender's previous pending entry expired recently — don't issue
+      // a fresh code yet. They saw a code already; the operator either
+      // wasn't going to approve it (silent ignore) or hasn't gotten to
+      // it. Prevents code-churning by waiting out the 1h expiry.
+      if (isInPairingCooldown(senderId)) return { action: 'drop' }
       const code = randomBytes(4).toString('hex')
       const now = Date.now()
       access.pending[code] = {
@@ -453,7 +528,14 @@ async function gate(event: SlackUserMessageEvent): Promise<GateResult> {
         expiresAt: now + 60 * 60 * 1000,
         replies: 1,
       }
-      saveAccess(access)
+      try { saveAccess(access) }
+      catch (err) {
+        // Disk write failed — roll back the in-memory mutation so the
+        // next inbound doesn't see a phantom pending entry.
+        delete access.pending[code]
+        process.stderr.write(`slack channel: saveAccess failed during pair issue: ${err}\n`)
+        return { action: 'drop' }
+      }
       return { action: 'pair', code, isResend: false }
     })
   }
@@ -496,6 +578,9 @@ function checkApprovals(): void {
   let files: string[]
   try { files = readdirSync(APPROVED_DIR) } catch { return }
   for (const senderId of files) {
+    // Skip in-progress writes from the access skill (it writes
+    // `<senderId>.tmp` then renames to `<senderId>` atomically).
+    if (senderId.endsWith('.tmp')) continue
     if (approvalsInFlight.has(senderId)) continue
     const file = join(APPROVED_DIR, senderId)
     let dmChannelId: string
@@ -662,8 +747,14 @@ async function annotateMentions(text: string): Promise<string> {
 // `file_share` = user uploaded a file (the most important one — without it
 // every file-upload event is silently dropped and the model never sees an
 // inbox attachment). `me_message` = `/me`-style. `thread_broadcast` = a
-// thread reply that's also broadcast to the channel.
-const DELIVERABLE_SUBTYPES = new Set<string>(['file_share', 'me_message', 'thread_broadcast'])
+// thread reply that's also broadcast to the channel. `huddle_thread` =
+// real-user text inside a slack huddle. System events like `bot_message`,
+// `channel_join`, `message_changed`, `message_deleted`, `tombstone`,
+// `ekm_access_denied`, `joiner_notification` correctly stay filtered.
+const DELIVERABLE_SUBTYPES = new Set<string>(['file_share', 'me_message', 'thread_broadcast', 'huddle_thread'])
+// Subtypes we've never observed; if one shows up, log once so we know
+// to either allowlist it (real-user content) or document the drop.
+const seenUnknownSubtypes = new Set<string>()
 
 app.event('message', async ({ event }) => {
   // Bolt fires 'message' for every subtype (~20 of them: bot_message,
@@ -671,7 +762,23 @@ app.event('message', async ({ event }) => {
   // forward plain user messages plus an allowlist of subtypes that are
   // still real-user content.
   const subtype = (event as { subtype?: string }).subtype
-  if (subtype && !DELIVERABLE_SUBTYPES.has(subtype)) return
+  if (subtype && !DELIVERABLE_SUBTYPES.has(subtype)) {
+    if (!seenUnknownSubtypes.has(subtype)) {
+      seenUnknownSubtypes.add(subtype)
+      process.stderr.write(`slack channel: dropped first inbound with subtype="${subtype}" (add to DELIVERABLE_SUBTYPES if real-user content)\n`)
+    }
+    return
+  }
+  // Drop messages from sister workspaces in an Enterprise Grid setup.
+  // BOT_USER_ID is workspace-scoped — gate semantics + outbound replies
+  // would race in confusing ways for cross-team events. Single-workspace
+  // is a documented v0.1 constraint; if/when multi-team support lands,
+  // this guard becomes a per-team config check instead.
+  const eventTeam = (event as { team?: string }).team
+  if (eventTeam && eventTeam !== TEAM_ID) {
+    process.stderr.write(`slack channel: dropping cross-team event (event.team=${eventTeam}, our team=${TEAM_ID})\n`)
+    return
+  }
   const msg = event as SlackUserMessageEvent
   if (!msg.user) return
   if (msg.user === BOT_USER_ID) return
@@ -753,7 +860,6 @@ app.event('message', async ({ event }) => {
         channel: msg.channel,
         ts: msg.thread_ts,
         limit: 1,
-        inclusive: true,
       })
       const r = root.messages?.[0]
       if (r) {
@@ -793,7 +899,7 @@ app.event('message', async ({ event }) => {
 
 // --- MCP server ---
 const mcp = new Server(
-  { name: 'slack', version: '0.1.8' },
+  { name: 'slack', version: '0.1.9' },
   {
     capabilities: {
       tools: {},
@@ -969,6 +1075,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         for (const f of files) {
           assertSendable(f)
           const st = statSync(f)
+          if (st.size === 0) throw new Error(`file is empty: ${f}`)
           if (st.size > MAX_ATTACHMENT_BYTES) {
             throw new Error(`file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB, max 50MB)`)
           }
@@ -999,6 +1106,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               sentTs.push(`file:${fileIds}`)
             } else {
               const r = await app.client.chat.postMessage({
+                ...POST_MESSAGE_DEFAULTS,
                 channel: chat_id,
                 text: chunks[i],
                 ...(thread_ts ? { thread_ts } : {}),
@@ -1025,7 +1133,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           try {
             await assertChannelAllowed(chat_id)
             for (const c of chunks) {
-              const r = await app.client.chat.postMessage({ channel: chat_id, text: c })
+              const r = await app.client.chat.postMessage({ ...POST_MESSAGE_DEFAULTS, channel: chat_id, text: c })
               const ts = String(r.ts ?? '')
               if (ts) noteSent(ts)
               sentTs.push(ts)
@@ -1056,7 +1164,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const message_id = args.message_id as string
         const text = args.text as string
         await assertChannelAllowed(chat_id)
-        const r = await app.client.chat.update({ channel: chat_id, ts: message_id, text: mdToMrkdwn(text) })
+        // Run through the same chunk pipeline reply uses so an oversized
+        // edit (>3000 chars) doesn't hit slack's section-block limit
+        // mid-update. edit can only target one message — error if the
+        // text would have to be split.
+        const chunks = chunkOutbound(text)
+        if (chunks.length !== 1) {
+          throw new Error(`edit_message body too long: ${text.length} chars splits into ${chunks.length} chunks; slack only edits one message at a time. Reply with chunked text instead.`)
+        }
+        const r = await app.client.chat.update({ channel: chat_id, ts: message_id, text: chunks[0] })
         return { content: [{ type: 'text', text: `edited (ts: ${r.ts})` }] }
       }
       case 'react': {
@@ -1180,6 +1296,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'pin_message': {
         const chat_id = args.chat_id as string
         const message_id = args.message_id as string
+        // Slack 1:1 DMs don't support pins (returns `cant_pin_message`
+        // for non-creator bots). Fail fast with a clearer error than
+        // the API's opaque code.
+        if (isDmChannel(chat_id)) {
+          throw new Error(`pin_message: slack 1:1 DMs do not support pins (chat_id=${chat_id})`)
+        }
         await assertChannelAllowed(chat_id)
         await app.client.pins.add({ channel: chat_id, timestamp: message_id })
         return { content: [{ type: 'text', text: 'pinned' }] }
@@ -1190,7 +1312,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const thread_ts = args.thread_ts as string | undefined
         await assertChannelAllowed(chat_id)
         assertSendable(file)
+        // Tool description says ogg/Opus; reject anything else so a
+        // misnamed wav doesn't upload as a generic attachment that
+        // doesn't render as audio.
+        if (!/\.(ogg|opus)$/i.test(file)) {
+          throw new Error(`send_voice_message expects .ogg/.opus (got: ${file})`)
+        }
         const st = statSync(file)
+        if (st.size === 0) throw new Error(`file is empty: ${file}`)
         if (st.size > MAX_ATTACHMENT_BYTES) throw new Error(`file too large: ${file} (${(st.size / 1024 / 1024).toFixed(1)}MB)`)
         // files.uploadV2's discriminated union types make conditional
         // thread_ts inclusion awkward to type. Cast through `unknown`
@@ -1240,6 +1369,9 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write(`slack channel: shutting down\n`)
+  // Clear the interval BEFORE the final cache save so a tick can't fire
+  // mid-rename and clobber the just-saved file.
+  clearInterval(usernameCacheSaveTimer)
   saveUsernameCache()
   setTimeout(() => process.exit(0), 2000)
   void app.stop().finally(() => process.exit(0))

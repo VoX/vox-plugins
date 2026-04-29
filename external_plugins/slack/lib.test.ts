@@ -96,6 +96,26 @@ describe('mdToMrkdwn', () => {
     expect(mdToMrkdwn('```\n[link](http://x)\n```'))
       .toBe('```\n[link](http://x)\n```')
   })
+  test('escapes <!channel> / <!here> / <!everyone> broadcast keywords', () => {
+    expect(mdToMrkdwn('user said <!channel> just now'))
+      .toBe('user said &lt;!channel&gt; just now')
+    expect(mdToMrkdwn('quote: <!here>')).toBe('quote: &lt;!here&gt;')
+    expect(mdToMrkdwn('ping <!everyone>')).toBe('ping &lt;!everyone&gt;')
+  })
+  test('escapes <@U…> user mentions in echoed prose', () => {
+    expect(mdToMrkdwn('user typed <@U06ABC123> to ping')).toBe('user typed &lt;@U06ABC123&gt; to ping')
+  })
+  test('escapes <#C…|name> channel mentions', () => {
+    expect(mdToMrkdwn('see <#C123|general>')).toBe('see &lt;#C123|general&gt;')
+  })
+  test('leaves bare <https://…> autolinks alone', () => {
+    expect(mdToMrkdwn('docs at <https://example.com>'))
+      .toBe('docs at <https://example.com>')
+  })
+  test('leaves <subteam^S…> mentions escaped (notification path)', () => {
+    expect(mdToMrkdwn('escalate to <!subteam^S123|@oncall>'))
+      .toBe('escalate to &lt;!subteam^S123|@oncall&gt;')
+  })
 })
 
 describe('parseSlackMentions', () => {

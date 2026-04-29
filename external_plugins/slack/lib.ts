@@ -65,8 +65,18 @@ export function mdToMrkdwn(text: string): string {
 }
 
 function transformProse(text: string): string {
+  // Targeted slack-mrkdwn injection guard: a user pasting `<!channel>`
+  // or `<@U…>` into a message we echo back would otherwise broadcast
+  // the workspace or ping unrelated users. Escape ONLY the dangerous
+  // forms (broadcast keywords, user mentions, channel mentions);
+  // leave bare `<https://…>` autolinks and `<text|label>` slack-link
+  // emit-form alone so the model's intentional output still works.
+  let out = text
+    .replace(/<!(here|channel|everyone|subteam\^[A-Z0-9]+(?:\|[^>]+)?)>/g, '&lt;!$1&gt;')
+    .replace(/<@(U[A-Z0-9]+)>/g, '&lt;@$1&gt;')
+    .replace(/<#(C[A-Z0-9]+(?:\|[^>]+)?)>/g, '&lt;#$1&gt;')
   // **bold** → *bold*. Non-greedy, escape-aware.
-  let out = text.replace(/(?<!\\)\*\*([^*\n]+?)\*\*/g, '*$1*')
+  out = out.replace(/(?<!\\)\*\*([^*\n]+?)\*\*/g, '*$1*')
   // ~~strike~~ → ~strike~. Same shape.
   out = out.replace(/(?<!\\)~~([^~\n]+?)~~/g, '~$1~')
   // [text](url) → <url|text>. Skip single-asterisk italic conversion —

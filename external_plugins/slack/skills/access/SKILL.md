@@ -93,9 +93,13 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 4. Add `senderId` to `allowFrom` (dedupe).
 5. Delete `pending[<code>]`.
 6. Write the updated access.json.
-7. `mkdir -p "$STATE_DIR/approved"` then write
-   `$STATE_DIR/approved/<senderId>` with `chatId` as the file contents. The
-   channel server polls this dir and sends "you're in".
+7. `mkdir -p "$STATE_DIR/approved"` then atomically drop the marker:
+   write `$STATE_DIR/approved/<senderId>.tmp` with `chatId` as the file
+   contents (NO trailing newline), then rename it to
+   `$STATE_DIR/approved/<senderId>`. The atomic rename matters because
+   the server's 5-second poller skips `.tmp` filenames; a direct
+   open-truncate-write would let the poller see an empty file mid-write
+   and silently drop the approval.
 8. Confirm: who was approved (senderId).
 
 ### `deny <code>`
