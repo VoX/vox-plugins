@@ -20,10 +20,9 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import { App } from '@slack/bolt'
 
-// Bolt's `app.event('message')` typings are a deep union (BotMessageEvent |
-// ChannelArchiveMessageEvent | …). We only deliver plain user messages —
-// this is the minimal shape for that case. The runtime guard
-// `'subtype' in event && event.subtype` narrows away the other variants.
+// Bolt's message-event union is wide (~20 subtypes). We only deliver
+// plain user messages; this is the minimal shape for that case, narrowed
+// by the `'subtype' in event && event.subtype` guard at the callsite.
 type SlackUserMessageEvent = {
   type: 'message'
   user: string
@@ -55,7 +54,7 @@ import {
 // respond, but with zero tools, no .env load, no Socket Mode connection,
 // no traffic at all.
 if (process.env.VOX_PLUGINS_ENABLED !== '1') {
-  const idle = new Server({ name: 'slack', version: '0.1.3' }, { capabilities: { tools: {} } })
+  const idle = new Server({ name: 'slack', version: '0.1.4' }, { capabilities: { tools: {} } })
   idle.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
   await idle.connect(new StdioServerTransport())
   await new Promise<never>(() => {})
@@ -99,6 +98,10 @@ if (!SLACK_BOT_TOKEN || !SLACK_APP_TOKEN) {
 }
 
 // --- Username cache for mention resolution ---
+// Capped to keep long-lived bots in big workspaces from growing the
+// cache without bound. Map iterates in insertion order, so dropping
+// the first key on overflow is a cheap-and-fine LRU stand-in.
+const MAX_USERNAME_CACHE = 5000
 const usernameCache = new Map<string, string>()
 let usernameCacheDirty = false
 try {
@@ -122,34 +125,57 @@ function saveUsernameCache(): void {
 setInterval(saveUsernameCache, 30_000).unref()
 
 function cacheUsername(id: string, name: string): void {
-  if (usernameCache.get(id) !== name) {
-    usernameCache.set(id, name)
-    usernameCacheDirty = true
+  if (usernameCache.get(id) === name) return
+  usernameCache.set(id, name)
+  usernameCacheDirty = true
+  if (usernameCache.size > MAX_USERNAME_CACHE) {
+    const oldest = usernameCache.keys().next().value
+    if (oldest !== undefined) usernameCache.delete(oldest)
+  }
+}
+
+// Resolve a slack user id to a display name (DM display > real > username
+// > raw id fallback). Caches results so subsequent calls are free.
+async function resolveDisplayName(userId: string): Promise<string> {
+  const cached = usernameCache.get(userId)
+  if (cached) return cached
+  try {
+    const r = await app.client.users.info({ user: userId })
+    const u = r.user
+    const name = u?.profile?.display_name || u?.real_name || u?.name || userId
+    cacheUsername(userId, name)
+    return name
+  } catch {
+    return userId
   }
 }
 
 // --- Dunk state ---
+// Loaded once at boot, mutated only by applyDunk/applyUndunk + lazy
+// expiry inside checkDunk. Keeping it in memory means inbound messages
+// don't pay a JSON parse on every event.
 type DunkEntry = { until: number | null; by: string; at: number; allow_mentions?: boolean }
 type DunkedState = Record<string, DunkEntry>
 
-function loadDunkedState(): DunkedState {
+let dunkedState: DunkedState = (() => {
   try { return JSON.parse(readFileSync(DUNKED_FILE, 'utf8')) as DunkedState } catch { return {} }
-}
-function saveDunkedState(state: DunkedState): void {
+})()
+
+function persistDunkedState(): void {
   try {
     const tmp = DUNKED_FILE + '.tmp'
-    writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 })
+    writeFileSync(tmp, JSON.stringify(dunkedState, null, 2) + '\n', { mode: 0o600 })
     renameSync(tmp, DUNKED_FILE)
   } catch (e) {
     process.stderr.write(`slack: dunk state save failed: ${e}\n`)
   }
 }
-function checkDunk(state: DunkedState, chatId: string): DunkEntry | null {
-  const entry = state[chatId]
+function checkDunk(chatId: string): DunkEntry | null {
+  const entry = dunkedState[chatId]
   if (!entry) return null
   if (entry.until !== null && entry.until <= Date.now()) {
-    delete state[chatId]
-    saveDunkedState(state)
+    delete dunkedState[chatId]
+    persistDunkedState()
     return null
   }
   return entry
@@ -161,21 +187,19 @@ function applyDunk(chatId: string, by: string, durationStr?: string | null, allo
     if (ms === null) return { ok: false as const, msg: `bad duration "${durationStr}" — try "2h30m" (units s/m/h/d)` }
     until = Date.now() + ms
   }
-  const state = loadDunkedState()
-  const wasAlready = !!state[chatId]
+  const wasAlready = !!dunkedState[chatId]
   const entry: DunkEntry = { until, by, at: Date.now() }
   if (allowMentions) entry.allow_mentions = true
-  state[chatId] = entry
-  saveDunkedState(state)
+  dunkedState[chatId] = entry
+  persistDunkedState()
   const dur = until === null ? 'indefinitely' : `until ${new Date(until).toISOString()}`
   const mentionNote = allowMentions ? ' (mentions still forwarded)' : ''
   return { ok: true as const, msg: `channel ${chatId} ${wasAlready ? 're-' : ''}dunked ${dur}${mentionNote}` }
 }
 function applyUndunk(chatId: string): string {
-  const state = loadDunkedState()
-  if (!state[chatId]) return `channel ${chatId} was not dunked`
-  delete state[chatId]
-  saveDunkedState(state)
+  if (!dunkedState[chatId]) return `channel ${chatId} was not dunked`
+  delete dunkedState[chatId]
+  persistDunkedState()
   return `channel ${chatId} undunked`
 }
 
@@ -476,9 +500,8 @@ async function downloadSlackFile(url: string, name: string, contentType: string 
   }
   const res = await fetch(url, { headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` } })
   if (!res.ok) throw new Error(`file fetch failed: ${res.status} ${res.statusText} (${url})`)
-  // `Buffer.from(new Uint8Array(...))` produces `Buffer<ArrayBuffer>` cleanly,
-  // avoiding the `ArrayBufferLike` widening that `Buffer.from(arrayBuffer)`
-  // returns under @types/node ≥ 22.
+  // Wrap in Uint8Array so the resulting Buffer is typed `Buffer<ArrayBuffer>`
+  // (widens to `ArrayBufferLike` otherwise, which @types/node ≥ 22 rejects).
   let buf: Buffer = Buffer.from(new Uint8Array(await res.arrayBuffer()))
   if (buf.length > MAX_ATTACHMENT_BYTES) {
     throw new Error(`file body too large: ${(buf.length / 1024 / 1024).toFixed(1)}MB`)
@@ -505,13 +528,7 @@ async function annotateMentions(text: string): Promise<string> {
     if (m.type === 'channel' && !usernameCache.has(m.id)) channelIds.push(m.id)
   }
   await Promise.all([
-    ...userIds.slice(0, 20).map(async id => {
-      try {
-        const r = await app.client.users.info({ user: id })
-        const name = (r.user?.profile?.display_name as string) || (r.user?.real_name as string) || (r.user?.name as string) || id
-        cacheUsername(id, name)
-      } catch {}
-    }),
+    ...userIds.slice(0, 20).map(id => resolveDisplayName(id)),
     ...channelIds.slice(0, 20).map(async id => {
       try {
         const r = await app.client.conversations.info({ channel: id })
@@ -562,7 +579,7 @@ app.event('message', async ({ event }) => {
   }
 
   // Dunk gate
-  const dunk = checkDunk(loadDunkedState(), msg.channel)
+  const dunk = checkDunk(msg.channel)
   if (dunk) {
     const text = msg.text ?? ''
     const mentioned = isMentioned(text, result.access.mentionPatterns)
@@ -580,29 +597,21 @@ app.event('message', async ({ event }) => {
   // File attachment listing (slack delivers files inline on the event
   // when the bot has files:read scope). We don't pre-download — model
   // calls download_attachment when it wants the bytes.
-  const files = (msg as any).files as Array<any> | undefined
+  const files = msg.files
   const atts: string[] = []
   if (Array.isArray(files)) {
     for (const f of files) {
-      const kb = ((f.size ?? 0) / 1024).toFixed(0)
+      const kb = (Number(f.size ?? 0) / 1024).toFixed(0)
       atts.push(`${safeFileName(String(f.name ?? f.id ?? 'file'))} (${f.mimetype ?? 'unknown'}, ${kb}KB)`)
     }
   }
 
-  // Resolve user mentions to display names where we can.
+  // Resolve mentions in body + sender display name in parallel — independent.
   const rawText = msg.text ?? (atts.length > 0 ? '(attachment)' : '')
-  const content = await annotateMentions(rawText)
-
-  // Resolve sender display name
-  let user = msg.user
-  try {
-    if (!usernameCache.has(msg.user)) {
-      const r = await app.client.users.info({ user: msg.user })
-      const name = (r.user?.profile?.display_name as string) || (r.user?.real_name as string) || (r.user?.name as string) || msg.user
-      cacheUsername(msg.user, name)
-    }
-    user = usernameCache.get(msg.user) ?? msg.user
-  } catch {}
+  const [content, user] = await Promise.all([
+    annotateMentions(rawText),
+    resolveDisplayName(msg.user),
+  ])
 
   // Thread context: if msg is a reply in a thread, fetch the root for context.
   let replyMeta: Record<string, string> = {}
@@ -616,15 +625,9 @@ app.event('message', async ({ event }) => {
       })
       const r = root.messages?.[0]
       if (r) {
-        let rUser = String(r.user ?? r.bot_id ?? 'unknown')
-        try {
-          if (r.user && !usernameCache.has(String(r.user))) {
-            const u = await app.client.users.info({ user: String(r.user) })
-            const name = (u.user?.profile?.display_name as string) || (u.user?.real_name as string) || (u.user?.name as string) || String(r.user)
-            cacheUsername(String(r.user), name)
-          }
-          rUser = (r.user && usernameCache.get(String(r.user))) || rUser
-        } catch {}
+        const rUser = r.user
+          ? await resolveDisplayName(String(r.user))
+          : String(r.bot_id ?? 'unknown')
         replyMeta = {
           reply_to: String(r.ts ?? msg.thread_ts),
           reply_to_author: rUser,
@@ -658,7 +661,7 @@ app.event('message', async ({ event }) => {
 
 // --- MCP server ---
 const mcp = new Server(
-  { name: 'slack', version: '0.1.3' },
+  { name: 'slack', version: '0.1.4' },
   {
     capabilities: {
       tools: {},
@@ -942,16 +945,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const msgs = (r.messages ?? []).slice().reverse()
         if (msgs.length === 0) return { content: [{ type: 'text', text: '(no messages)' }] }
         const out = await Promise.all(msgs.map(async (m: any) => {
-          let who = String(m.user ?? m.bot_id ?? 'unknown')
-          if (m.user && !usernameCache.has(String(m.user))) {
-            try {
-              const u = await app.client.users.info({ user: String(m.user) })
-              const name = (u.user?.profile?.display_name as string) || (u.user?.real_name as string) || (u.user?.name as string) || String(m.user)
-              cacheUsername(String(m.user), name)
-            } catch {}
-          }
-          if (m.user) who = usernameCache.get(String(m.user)) ?? who
+          let who: string
           if (m.user === BOT_USER_ID) who = 'me'
+          else if (m.user) who = await resolveDisplayName(String(m.user))
+          else who = String(m.bot_id ?? 'unknown')
           const fileCount = Array.isArray(m.files) ? m.files.length : 0
           const filesPart = fileCount > 0 ? ` +${fileCount}file` : ''
           const tsIso = new Date(parseFloat(String(m.ts)) * 1000).toISOString()
