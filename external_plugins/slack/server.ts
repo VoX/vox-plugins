@@ -54,7 +54,7 @@ import {
 // respond, but with zero tools, no .env load, no Socket Mode connection,
 // no traffic at all.
 if (process.env.VOX_PLUGINS_ENABLED !== '1') {
-  const idle = new Server({ name: 'slack', version: '0.1.4' }, { capabilities: { tools: {} } })
+  const idle = new Server({ name: 'slack', version: '0.1.5' }, { capabilities: { tools: {} } })
   idle.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
   await idle.connect(new StdioServerTransport())
   await new Promise<never>(() => {})
@@ -237,6 +237,14 @@ const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024  // slack's tier-1 file cap is gen
 const BULK_REPLY_MAX_CHANNELS = 20
 const MAX_IMAGE_LONG_EDGE = 1600
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+// Md→mrkdwn + chunk-by-the-current-access-policy limit. Used by both
+// reply and bulk_reply so the chunk size + formatting stay aligned.
+function chunkOutbound(text: string): string[] {
+  const access = loadAccess()
+  const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, HARD_CHUNK_CEILING))
+  return chunk(mdToMrkdwn(text), limit)
+}
 
 function readAccessFile(): Access {
   try {
@@ -661,7 +669,7 @@ app.event('message', async ({ event }) => {
 
 // --- MCP server ---
 const mcp = new Server(
-  { name: 'slack', version: '0.1.4' },
+  { name: 'slack', version: '0.1.5' },
   {
     capabilities: {
       tools: {},
@@ -839,9 +847,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
         if (files.length > 10) throw new Error('Slack max 10 file attachments per message')
 
-        const access = loadAccess()
-        const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, HARD_CHUNK_CEILING))
-        const chunks = chunk(mdToMrkdwn(rawText), limit)
+        const chunks = chunkOutbound(rawText)
         const sentTs: string[] = []
         try {
           for (let i = 0; i < chunks.length; i++) {
@@ -859,8 +865,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
                 ...(thread_ts ? { thread_ts } : {}),
               })
               // uploadV2 returns { files: [{ id, ... }] }; the chat ts
-              // for the parent message isn't trivially exposed.
-              const fileIds = ((result as any).files as Array<any> | undefined)?.map(f => f.id ?? '?').join(',') ?? ''
+              // for the parent message isn't trivially exposed, so we
+              // surface the file ids as the synthetic identifier.
+              const uploaded = (result as { files?: Array<{ id?: string }> }).files
+              const fileIds = uploaded?.map(f => f.id ?? '?').join(',') ?? ''
               sentTs.push(`file:${fileIds}`)
             } else {
               const r = await app.client.chat.postMessage({
@@ -884,9 +892,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const text = args.text as string
         if (!Array.isArray(chat_ids) || chat_ids.length === 0) throw new Error('chat_ids must be a non-empty array')
         if (chat_ids.length > BULK_REPLY_MAX_CHANNELS) throw new Error(`bulk_reply max ${BULK_REPLY_MAX_CHANNELS} channels per call (got ${chat_ids.length})`)
-        const access = loadAccess()
-        const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, HARD_CHUNK_CEILING))
-        const chunks = chunk(mdToMrkdwn(text), limit)
+        const chunks = chunkOutbound(text)
         const results = await Promise.all(chat_ids.map(async chat_id => {
           const sentTs: string[] = []
           try {
@@ -1029,7 +1035,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           ...(thread_ts ? { thread_ts } : {}),
         }
         const result = await app.client.files.uploadV2(uploadArgs as unknown as Parameters<typeof app.client.files.uploadV2>[0])
-        const fileIds = ((result as any).files as Array<any> | undefined)?.map(f => f.id ?? '?').join(',') ?? ''
+        const uploaded = (result as { files?: Array<{ id?: string }> }).files
+        const fileIds = uploaded?.map(f => f.id ?? '?').join(',') ?? ''
         return { content: [{ type: 'text', text: `voice file uploaded (file ids: ${fileIds})` }] }
       }
       case 'dunk': {
