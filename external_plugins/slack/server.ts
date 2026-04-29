@@ -54,7 +54,7 @@ import {
 // respond, but with zero tools, no .env load, no Socket Mode connection,
 // no traffic at all.
 if (process.env.VOX_PLUGINS_ENABLED !== '1') {
-  const idle = new Server({ name: 'slack', version: '0.1.9' }, { capabilities: { tools: {} } })
+  const idle = new Server({ name: 'slack', version: '0.1.10' }, { capabilities: { tools: {} } })
   idle.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
   await idle.connect(new StdioServerTransport())
   // Idle path needs SIGTERM/stdin-EOF handlers too — without them
@@ -430,6 +430,15 @@ app.error(async err => {
   process.stderr.write(`slack channel: bolt error: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`)
 })
 
+// Refresh BOT_HANDLE the moment a workspace admin renames the bot. The
+// 1h timer below is the fallback for events the WS missed; this is the
+// fast path. Requires `user_change` in the manifest event_subscriptions.
+app.event('user_change', async ({ event }) => {
+  const ev = event as { user?: { id?: string } }
+  if (ev.user?.id !== BOT_USER_ID) return
+  await refreshBotHandle()
+})
+
 // auth.test gives us our own user id + workspace id at startup. Cache
 // these — gate() consults botUserId for mention detection.
 let BOT_USER_ID = ''
@@ -458,6 +467,29 @@ async function loadSelf(): Promise<void> {
   process.stderr.write(`slack channel: bot=${BOT_HANDLE} (${BOT_USER_ID}) team=${TEAM_ID}\n`)
 }
 
+// Refresh BOT_HANDLE periodically. The bot user id doesn't change without
+// a reinstall, but the handle (display name) can be edited any time by
+// a workspace admin — without refresh the `@bot-name` mention pattern
+// goes stale and channels with requireMention=true silently stop
+// forwarding @-mentions until the next process restart.
+//
+// Also wired to the `user_change` event below for the bot's own user
+// id so a rename takes effect immediately, with the timer as fallback
+// for rename events the WebSocket missed.
+async function refreshBotHandle(): Promise<void> {
+  try {
+    const r = await app.client.users.info({ user: BOT_USER_ID })
+    const next = (r.user?.name as string) || (r.user?.profile?.display_name as string) || BOT_HANDLE
+    if (next && next !== BOT_HANDLE) {
+      process.stderr.write(`slack channel: bot handle changed: ${BOT_HANDLE} → ${next}\n`)
+      BOT_HANDLE = next
+      rebuildBotHandleMention()
+    }
+  } catch (err) {
+    process.stderr.write(`slack channel: refreshBotHandle failed: ${err}\n`)
+  }
+}
+
 // Escape a string for safe interpolation into a regex pattern. BOT_HANDLE
 // comes from auth.test (workspace-controlled) and may contain `.` or `-`
 // which would otherwise over-match (or `(` which would throw).
@@ -474,15 +506,28 @@ function rebuildBotHandleMention(): void {
     : null
 }
 
+// Cache user-supplied mentionPatterns regex objects keyed by the pattern
+// string. Compiling a regex per inbound message wastes work and a malformed
+// pattern would re-throw every time. `null` cached for invalid patterns
+// so we don't keep retrying the compile.
+const compiledMentionPatterns = new Map<string, RegExp | null>()
+function compiledMentionPattern(pat: string): RegExp | null {
+  if (compiledMentionPatterns.has(pat)) return compiledMentionPatterns.get(pat) ?? null
+  let re: RegExp | null = null
+  try { re = new RegExp(pat, 'i') } catch {}
+  compiledMentionPatterns.set(pat, re)
+  return re
+}
+
 function isMentioned(text: string, mentionPatterns?: string[]): boolean {
   if (BOT_USER_ID && text.includes(`<@${BOT_USER_ID}>`)) return true
   if (BOT_HANDLE_MENTION_RE && BOT_HANDLE_MENTION_RE.test(text)) return true
   for (const pat of mentionPatterns ?? []) {
-    // Wrap BOTH compile and test — a malicious / typo'd pattern could
-    // be syntactically valid but have catastrophic backtracking against
-    // attacker-controlled prose. Failing closed (ignore the pattern) is
-    // safer than letting one bad regex stall the inbound loop.
-    try { if (new RegExp(pat, 'i').test(text)) return true } catch {}
+    const re = compiledMentionPattern(pat)
+    // Wrap `.test` even for cached regexes — catastrophic backtracking is
+    // an exec-time issue, not a compile-time one. Failing closed (ignore
+    // the pattern) is safer than stalling the inbound loop.
+    try { if (re && re.test(text)) return true } catch {}
   }
   return false
 }
@@ -513,11 +558,17 @@ async function gate(event: SlackUserMessageEvent): Promise<GateResult> {
           return { action: 'pair', code, isResend: true }
         }
       }
-      if (Object.keys(access.pending).length >= 3) return { action: 'drop' }
+      // Per-sender cap (one pending at a time per slack user). The
+      // earlier global-of-3 cap was DoS'able: three concurrent unknown
+      // senders could fill the table and block legitimate fourth users
+      // silently. Per-sender means each sender has independent quota,
+      // and the existing pending-loop above already returned an early
+      // 'pair'/`isResend:true` when this user already has an entry —
+      // so reaching this line means there's NO existing pending for
+      // this senderId and we're safe to issue one.
       // Sender's previous pending entry expired recently — don't issue
-      // a fresh code yet. They saw a code already; the operator either
-      // wasn't going to approve it (silent ignore) or hasn't gotten to
-      // it. Prevents code-churning by waiting out the 1h expiry.
+      // a fresh code yet. Prevents code-churning by waiting out the 1h
+      // expiry then DM'ing for a brand-new code.
       if (isInPairingCooldown(senderId)) return { action: 'drop' }
       const code = randomBytes(4).toString('hex')
       const now = Date.now()
@@ -619,10 +670,14 @@ async function assertChannelAllowed(chatId: string): Promise<void> {
     const info = await app.client.conversations.info({ channel: chatId })
     const userId = (info.channel as { user?: string } | undefined)?.user
     if (userId && access.allowFrom.includes(userId)) return
-    throw new Error(`channel ${chatId} (DM) is not allowlisted — add via /slack:access`)
+    throw new Error(`channel ${chatId} (DM) is not allowlisted — add the user id (U…) via /slack:access allow <userId>`)
   }
   if (chatId in access.groups) return
-  throw new Error(`channel ${chatId} is not opted in — add via /slack:access`)
+  // Group-channel failure modes are commonly conflated by operators:
+  //   1. `chatId` not in access.json groups — fix: /slack:access group add
+  //   2. chatId IS in groups but bot isn't a slack-side member — fix: /invite @<bot> in slack
+  // The error covers both bases so the operator doesn't have to guess.
+  throw new Error(`channel ${chatId} is not opted in — add via /slack:access group add ${chatId}, AND make sure the bot is /invite'd to the channel in slack itself (the group-add only flips our own gate; slack's membership is separate)`)
 }
 
 function assertSendable(f: string): void {
@@ -899,7 +954,7 @@ app.event('message', async ({ event }) => {
 
 // --- MCP server ---
 const mcp = new Server(
-  { name: 'slack', version: '0.1.9' },
+  { name: 'slack', version: '0.1.10' },
   {
     capabilities: {
       tools: {},
@@ -1363,6 +1418,12 @@ try {
   process.exit(1)
 }
 
+// Hourly refresh as the fallback path for the user_change event handler
+// — covers WS-missed renames + slack docs warning that user_change isn't
+// guaranteed to deliver under all reinstall paths.
+const botHandleRefreshTimer = setInterval(() => { void refreshBotHandle() }, 60 * 60 * 1000)
+botHandleRefreshTimer.unref()
+
 // --- Graceful shutdown ---
 let shuttingDown = false
 function shutdown(): void {
@@ -1372,6 +1433,7 @@ function shutdown(): void {
   // Clear the interval BEFORE the final cache save so a tick can't fire
   // mid-rename and clobber the just-saved file.
   clearInterval(usernameCacheSaveTimer)
+  clearInterval(botHandleRefreshTimer)
   saveUsernameCache()
   setTimeout(() => process.exit(0), 2000)
   void app.stop().finally(() => process.exit(0))

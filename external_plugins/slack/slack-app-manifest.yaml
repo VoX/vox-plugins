@@ -53,6 +53,9 @@ settings:
       - message.groups
       - message.im
       - message.mpim
+      # user_change so the bot picks up its own rename without waiting for
+      # the hourly refresh timer. Filtered to our own user id at handler.
+      - user_change
   socket_mode_enabled: true
   org_deploy_enabled: false
   is_hosted: false
