@@ -1,0 +1,57 @@
+_metadata:
+  major_version: 1
+display_information:
+  name: claude-channel
+  description: Claude Code messaging bridge — Slack
+  long_description: |
+    Lets a Claude Code session receive Slack messages and reply, react,
+    edit messages, fetch channel history, etc. via MCP tools. Equivalent
+    to the Discord bridge plugin but for Slack workspaces. Uses Socket
+    Mode so no public URL is required — the bot opens a WebSocket out
+    to Slack and receives events bidirectionally.
+  background_color: "#4a154b"
+features:
+  bot_user:
+    display_name: claude
+    always_online: true
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - channels:history
+      - channels:read
+      - chat:write
+      - chat:write.public
+      - files:read
+      - files:write
+      - groups:history
+      - groups:read
+      - im:history
+      - im:read
+      - im:write
+      - mpim:history
+      - mpim:read
+      - pins:read
+      - pins:write
+      - reactions:read
+      - reactions:write
+      - users:read
+      - users:read.email
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+      - reaction_added
+      - reaction_removed
+  socket_mode_enabled: true
+  org_deploy_enabled: false
+  is_hosted: false
+  token_rotation_enabled: false
