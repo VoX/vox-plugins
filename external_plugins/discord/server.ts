@@ -3614,11 +3614,30 @@ async function handleInbound(msg: Message): Promise<void> {
     }
   }
 
+  // A permission reply is "yes/no <request id>" AND a request with that id must actually be
+  // pending. The shape alone is not enough: "no tests" is `no` + a five-letter word, and it was
+  // being read as denying request `tests` — reacted, notified, and returned before the message
+  // ever reached the model. The fail-OPEN direction is the reason this is a real bug rather than a
+  // cosmetic one: "yes ready" matches too and sends behavior:allow, so an ordinary English message
+  // could approve a tool call nobody looked at. Resolving against pendingPermissions makes the
+  // whole class impossible instead of merely narrower.
+  //
+  // Matched case-insensitively but reported with the STORED id: request_id is whatever the harness
+  // gave us and is echoed back verbatim, so lowercasing it before sending would break a real reply
+  // to any id that is not already lower case.
+  const permMatch = PERMISSION_REPLY_RE.exec(msg.content)
+  let permRequestId: string | undefined
+  if (permMatch) {
+    const typed = permMatch[1] ? permMatch[2]!.toLowerCase() : undefined
+    if (typed) for (const id of pendingPermissions.keys()) if (id.toLowerCase() === typed) { permRequestId = id; break }
+  }
+
   // Log authorized inbound (incl. while dunked) BEFORE the dunk gate, which governs
   // delivery only; the body is built here only when logging, then reused for delivery
   // below. Permission-reply tokens ("yes <code>") are control messages — skip them.
+  // Only REAL ones: a message that merely looks like one is ordinary chat and belongs in the log.
   let body: { content: string; atts: string[] } | undefined
-  if (MESSAGE_LOG && !PERMISSION_REPLY_RE.test(msg.content)) {
+  if (MESSAGE_LOG && permRequestId === undefined) {
     body = await buildInboundBody(msg)
     logMessage({
       chat_id,
@@ -3648,12 +3667,13 @@ async function handleInbound(msg: Message): Promise<void> {
   // pending permission request, emit the structured event instead of
   // relaying as chat. The sender is already gate()-approved at this point
   // (non-allowlisted senders were dropped above), so we trust the reply.
-  const permMatch = PERMISSION_REPLY_RE.exec(msg.content)
-  if (permMatch) {
+  // permMatch/permRequestId are resolved above, before the log gate, so both agree on what counts
+  // as a control message. No pending request with that id -> this is just someone talking.
+  if (permMatch && permRequestId !== undefined) {
     void mcp.notification({
       method: 'notifications/claude/channel/permission',
       params: {
-        request_id: permMatch[2]!.toLowerCase(),
+        request_id: permRequestId,
         behavior: permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny',
       },
     })
