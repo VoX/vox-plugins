@@ -75,6 +75,8 @@ The outbound tools (`reply`, `react`, `edit_message`, `fetch_messages`, `downloa
 
 **A server grant has no per-channel exclusion, and nothing quiets the outbound side.** A stricter channel entry (`--allow` a single ID) or `/dunk` can quiet what the bot *hears* in one channel, but neither stops it *sending* there: the channel is still granted, so `reply`, `react`, `fetch_messages` and the rest still work in it. If a server has a channel the bot must not touch at all, don't grant the server — grant its channels one by one instead.
 
+**A server grant also switches on the guild-scoped admin tools** (0.8.6): member reads, roles, timeouts, kicks, bans, nicknames, and creating or deleting channels in that server, all with no approval step. A channel grant never does. If the bot should talk in a whole server but not moderate it, grant its channels instead. See [Admin tools](./README.md#admin-tools).
+
 ## The /access slash command
 
 `/access` manages guild-channel access from inside Discord — no terminal

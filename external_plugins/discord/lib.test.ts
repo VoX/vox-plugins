@@ -1809,3 +1809,300 @@ describe('resolveOrderingConstraints', () => {
     expect(namedOrderingConstraints({ roles: [{ name: 'A' }] })).toEqual([])
   })
 })
+
+// ── 0.8.6 admin tools: the pure decisions ─────────────────────────────────────────────────────────
+import {
+  ADMIN_TOOL_SCOPE, isAdminTool, guildGranted, adminGuildRefusal, requiredAdminPerms, missingPermsRefusal,
+  roleDangerousPerms, roleOutranks, roleAssignRefusal, memberActionRefusal, requireSnowflake, requireName,
+  timeoutMs, MAX_TIMEOUT_MINUTES, banDeleteSeconds, slowmodeSeconds, createChannelKind, parseBulkDeleteArgs,
+  snowflakeTimestamp, partitionBulkDeletable, BULK_DELETE_MAX_AGE_MS, formatMemberRow, formatReactionRows,
+  type AdminToolName,
+} from './lib'
+import { ChannelType as CT } from 'discord.js'
+
+const AG = '111111111111111111'      // a granted guild
+const AG2 = '222222222222222222'     // a guild with only a CHANNEL grant inside it
+const CH_IN_AG2 = '333333333333333333'
+const grantAccess = () => ({
+  groups: { [CH_IN_AG2]: { requireMention: true, allowFrom: [] } },
+  guilds: { [AG]: { requireMention: true, allowFrom: [] } },
+})
+
+describe('ADMIN_TOOL_SCOPE — which allow-check each admin tool goes through', () => {
+  test('roles, members, bans and channel create/delete are guild-scoped; message/channel tools are channel-scoped', () => {
+    const guild = Object.entries(ADMIN_TOOL_SCOPE).filter(([, s]) => s === 'guild').map(([t]) => t).sort()
+    const channel = Object.entries(ADMIN_TOOL_SCOPE).filter(([, s]) => s === 'channel').map(([t]) => t).sort()
+    expect(guild).toEqual(['add_role', 'ban_member', 'create_channel', 'delete_channel', 'get_member', 'kick_member',
+      'list_members', 'remove_role', 'set_nickname', 'timeout_member', 'unban_member'])
+    expect(channel).toEqual(['bulk_delete', 'create_thread', 'delete_message', 'edit_channel', 'fetch_reactions'])
+  })
+
+  test('isAdminTool is own-property only — existing tools and prototype keys are not admin tools', () => {
+    expect(isAdminTool('kick_member')).toBe(true)
+    expect(isAdminTool('reply')).toBe(false)
+    expect(isAdminTool('apply_server_spec')).toBe(false)
+    expect(isAdminTool('constructor')).toBe(false)
+    expect(isAdminTool('toString')).toBe(false)
+  })
+})
+
+describe('adminGuildRefusal — the guild-scope gate', () => {
+  test('a guild with a server grant passes', () => {
+    expect(guildGranted(grantAccess(), AG)).toBe(true)
+    expect(adminGuildRefusal(grantAccess(), AG, 'Wheat', 'kick_member')).toBeNull()
+  })
+
+  test('a guild with only a CHANNEL grant inside it is refused — a channel grant does not reach roles/members', () => {
+    expect(guildGranted(grantAccess(), AG2)).toBe(false)
+    const r = adminGuildRefusal(grantAccess(), AG2, 'Cow', 'ban_member')
+    expect(r).toContain('no server grant')
+    expect(r).toContain('ban_member')
+    expect(r).toContain(AG2)
+    expect(r).toContain('"Cow"')
+  })
+
+  test('the bot not being in the guild is refused FIRST, even when a stale grant exists for it', () => {
+    expect(adminGuildRefusal(grantAccess(), AG, null, 'kick_member')).toBe(`bot is not in guild ${AG}`)
+  })
+
+  test('no guilds map, a null one, and prototype keys all refuse instead of throwing or matching', () => {
+    expect(adminGuildRefusal({}, AG, 'X', 'get_member')).toContain('no server grant')
+    expect(adminGuildRefusal({ guilds: null }, AG, 'X', 'get_member')).toContain('no server grant')
+    expect(guildGranted({ guilds: {} }, 'constructor')).toBe(false)
+    expect(guildGranted({ guilds: {} }, '__proto__')).toBe(false)
+  })
+
+  test('the channel-scoped check is channelAllowed — a channel grant passes it, a server grant covers every channel', () => {
+    const a = grantAccess()
+    expect(channelAllowed(a, { id: CH_IN_AG2, isThread: false, guildId: AG2 })).toBe(true)
+    expect(channelAllowed(a, { id: '444444444444444444', isThread: false, guildId: AG2 })).toBe(false)
+    expect(channelAllowed(a, { id: '555555555555555555', isThread: false, guildId: AG })).toBe(true)
+    // a category in a granted guild — edit_channel resolves it the same way
+    expect(channelAllowed(a, { id: '666666666666666666', isThread: false, parentId: null, guildId: AG })).toBe(true)
+  })
+})
+
+describe('requiredAdminPerms — what the BOT must hold for each call', () => {
+  test('deleting your own message needs nothing; anyone else\'s needs ManageMessages', () => {
+    expect(requiredAdminPerms('delete_message', { ownMessage: true })).toEqual([])
+    expect(requiredAdminPerms('delete_message', { ownMessage: false })).toEqual(['ManageMessages'])
+    expect(requiredAdminPerms('delete_message')).toEqual(['ManageMessages'])   // unknown ownership = others'
+  })
+
+  test('own nickname needs ChangeNickname; someone else\'s needs ManageNicknames', () => {
+    expect(requiredAdminPerms('set_nickname', { self: true })).toEqual(['ChangeNickname'])
+    expect(requiredAdminPerms('set_nickname', { self: false })).toEqual(['ManageNicknames'])
+  })
+
+  test('moderation tools need their own permission', () => {
+    expect(requiredAdminPerms('kick_member')).toEqual(['KickMembers'])
+    expect(requiredAdminPerms('ban_member')).toEqual(['BanMembers'])
+    expect(requiredAdminPerms('unban_member')).toEqual(['BanMembers'])
+    expect(requiredAdminPerms('timeout_member')).toEqual(['ModerateMembers'])
+    expect(requiredAdminPerms('add_role')).toEqual(['ManageRoles'])
+    expect(requiredAdminPerms('remove_role')).toEqual(['ManageRoles'])
+    expect(requiredAdminPerms('delete_channel', { isThread: true })).toEqual(['ManageThreads'])
+    expect(requiredAdminPerms('delete_channel')).toEqual(['ManageChannels'])
+    expect(requiredAdminPerms('bulk_delete')).toContain('ManageMessages')
+  })
+
+  test('every name it returns, for every tool and context, is a real PermissionFlagsBits key', () => {
+    const ctxs = [{}, { ownMessage: true }, { self: true }, { isThread: true }]
+    for (const t of Object.keys(ADMIN_TOOL_SCOPE) as AdminToolName[])
+      for (const c of ctxs) expect(() => validatePermissionNames(requiredAdminPerms(t, c), t)).not.toThrow()
+  })
+
+  test('missingPermsRefusal names every missing permission and passes when all are held', () => {
+    const has = (p: string) => p === 'ViewChannel'
+    const r = missingPermsRefusal(['ViewChannel', 'ManageMessages', 'ReadMessageHistory'], has, 'in #general (1)')
+    expect(r).toContain('ManageMessages, ReadMessageHistory')
+    expect(r).not.toContain('ViewChannel,')
+    expect(r).toContain('#general')
+    expect(missingPermsRefusal(['ViewChannel'], has, 'x')).toBeNull()
+    expect(missingPermsRefusal([], () => false, 'x')).toBeNull()
+  })
+})
+
+describe('roleDangerousPerms — the informational ⚠ on add_role/remove_role', () => {
+  test('flags the same list apply_server_spec flags, and nothing benign', () => {
+    expect(roleDangerousPerms(['SendMessages', 'Administrator', 'BanMembers'])).toEqual(['Administrator', 'BanMembers'])
+    expect(roleDangerousPerms(['ManageGuild', 'ManageRoles'])).toEqual(['ManageGuild', 'ManageRoles'])
+    expect(roleDangerousPerms(['SendMessages', 'ViewChannel', 'AddReactions'])).toEqual([])
+  })
+})
+
+describe('roleOutranks / roleAssignRefusal — Discord\'s hierarchy rule', () => {
+  const bot = { id: '500000000000000000', name: 'tinyclaw', rawPosition: 5 }
+  const ctx = { guildId: AG, botHighest: bot, botIsGuildOwner: false }
+
+  test('higher raw position wins; on a tie the OLDER snowflake wins; nothing outranks itself', () => {
+    expect(roleOutranks({ id: '9', rawPosition: 3 }, { id: '1', rawPosition: 2 })).toBe(true)
+    expect(roleOutranks({ id: '100000000000000000', rawPosition: 2 }, { id: '200000000000000000', rawPosition: 2 })).toBe(true)
+    expect(roleOutranks({ id: '200000000000000000', rawPosition: 2 }, { id: '100000000000000000', rawPosition: 2 })).toBe(false)
+    expect(roleOutranks(bot, bot)).toBe(false)
+  })
+
+  test('a role below the bot can be assigned', () => {
+    expect(roleAssignRefusal({ id: '400000000000000000', name: 'Member', rawPosition: 4, managed: false }, ctx)).toBeNull()
+  })
+
+  test('a role at or above the bot is refused with both role names and the id', () => {
+    const r = roleAssignRefusal({ id: '600000000000000000', name: 'Admin', rawPosition: 6, managed: false }, ctx)
+    expect(r).toContain('"Admin" (600000000000000000)')
+    expect(r).toContain('"tinyclaw"')
+    // the bot's own role, and a raw tie the bot loses on snowflake age
+    expect(roleAssignRefusal({ ...bot, managed: false }, ctx)).not.toBeNull()
+    expect(roleAssignRefusal({ id: '100000000000000000', name: 'Old', rawPosition: 5, managed: false }, ctx)).not.toBeNull()
+  })
+
+  test('@everyone and managed roles are refused regardless of position', () => {
+    expect(roleAssignRefusal({ id: AG, name: '@everyone', rawPosition: 0, managed: false }, ctx)).toContain('@everyone')
+    expect(roleAssignRefusal({ id: '400000000000000001', name: 'Booster', rawPosition: 1, managed: true }, ctx)).toContain('managed')
+  })
+
+  test('a bot that OWNS the guild may assign any non-managed role', () => {
+    expect(roleAssignRefusal({ id: '600000000000000000', name: 'Admin', rawPosition: 6, managed: false }, { ...ctx, botIsGuildOwner: true })).toBeNull()
+  })
+})
+
+describe('memberActionRefusal — owner, self, hierarchy, admin-timeout', () => {
+  const botHighest = { id: '500000000000000000', name: 'tinyclaw', rawPosition: 5 }
+  const ctx = { botId: '900000000000000000', guildOwnerId: '800000000000000000', botHighest }
+  const low = { id: '700000000000000000', name: 'pindyj', highest: { id: '100000000000000000', name: 'Member', rawPosition: 1 }, isAdministrator: false }
+  const high = { ...low, name: 'mod', highest: { id: '600000000000000000', name: 'Mod', rawPosition: 6 } }
+
+  test('a member below the bot can be timed out, kicked, banned and renamed', () => {
+    for (const a of ['timeout', 'kick', 'ban', 'nickname'] as const) expect(memberActionRefusal(a, ctx, low)).toBeNull()
+  })
+
+  test('a member at or above the bot is refused, naming both roles', () => {
+    const r = memberActionRefusal('kick', ctx, high)
+    expect(r).toContain('"Mod"')
+    expect(r).toContain('"tinyclaw"')
+    expect(r).toContain('700000000000000000')
+    expect(memberActionRefusal('timeout', ctx, { ...low, highest: botHighest })).not.toBeNull()
+  })
+
+  test('the guild owner can never be acted on — not even renamed', () => {
+    for (const a of ['timeout', 'kick', 'ban', 'nickname'] as const)
+      expect(memberActionRefusal(a, ctx, { ...low, id: ctx.guildOwnerId })).toContain('owns the server')
+  })
+
+  test('the bot cannot moderate itself, but may set its own nickname', () => {
+    for (const a of ['timeout', 'kick', 'ban'] as const) expect(memberActionRefusal(a, ctx, { ...low, id: ctx.botId })).toContain('itself')
+    expect(memberActionRefusal('nickname', ctx, { ...high, id: ctx.botId })).toBeNull()
+  })
+
+  test('administrators cannot be timed out (Discord refuses), even below the bot', () => {
+    expect(memberActionRefusal('timeout', ctx, { ...low, isAdministrator: true })).toContain('Administrator')
+    expect(memberActionRefusal('kick', ctx, { ...low, isAdministrator: true })).toBeNull()
+  })
+
+  test('a non-member can be banned by id, but not kicked, timed out or renamed', () => {
+    const ghost = { ...low, highest: null }
+    expect(memberActionRefusal('ban', ctx, ghost)).toBeNull()
+    for (const a of ['timeout', 'kick', 'nickname'] as const) expect(memberActionRefusal(a, ctx, ghost)).toContain('not a member')
+  })
+
+  test('a bot that owns the guild skips the hierarchy check', () => {
+    expect(memberActionRefusal('kick', { ...ctx, guildOwnerId: ctx.botId }, high)).toBeNull()
+  })
+})
+
+describe('admin argument validation', () => {
+  test('requireSnowflake accepts ids (string or number) and rejects everything else', () => {
+    expect(requireSnowflake(' 123456789012345678 ', 'x')).toBe('123456789012345678')
+    for (const bad of ['', 'abc', '12', '<@123456789012345678>', null, undefined, {}, '1'.repeat(25)])
+      expect(() => requireSnowflake(bad, 'user_id')).toThrow(/user_id must be a Discord id/)
+  })
+
+  test('requireName counts code points, so an emoji is one character', () => {
+    expect(requireName('🦝'.repeat(100), 'name', 100)).toBe('🦝'.repeat(100))
+    expect(() => requireName('a'.repeat(101), 'name', 100)).toThrow(/101 characters/)
+    expect(() => requireName('   ', 'name', 100)).toThrow(/required/)
+  })
+
+  test('timeoutMs: 0 lifts, minutes become ms, 28 days is the ceiling', () => {
+    expect(timeoutMs(0)).toBeNull()
+    expect(timeoutMs(60)).toBe(3_600_000)
+    expect(timeoutMs(MAX_TIMEOUT_MINUTES)).toBe(28 * 24 * 3_600_000)
+    for (const bad of [MAX_TIMEOUT_MINUTES + 1, -1, NaN, Infinity, '5', undefined])
+      expect(() => timeoutMs(bad)).toThrow(/minutes must be/)
+  })
+
+  test('banDeleteSeconds defaults to 0 and caps at 7 days', () => {
+    expect(banDeleteSeconds(undefined)).toBe(0)
+    expect(banDeleteSeconds(604800)).toBe(604800)
+    for (const bad of [604801, -1, 1.5, '60']) expect(() => banDeleteSeconds(bad)).toThrow(/delete_message_seconds/)
+  })
+
+  test('slowmodeSeconds caps at 6h', () => {
+    expect(slowmodeSeconds(0)).toBe(0)
+    expect(slowmodeSeconds(21600)).toBe(21600)
+    expect(() => slowmodeSeconds(21601)).toThrow(/slowmode/)
+  })
+
+  test('createChannelKind maps the three kinds and refuses the rest', () => {
+    expect(createChannelKind('text')).toBe(CT.GuildText)
+    expect(createChannelKind('voice')).toBe(CT.GuildVoice)
+    expect(createChannelKind('category')).toBe(CT.GuildCategory)
+    expect(() => createChannelKind('forum')).toThrow(/text, voice or category/)
+  })
+
+  test('parseBulkDeleteArgs: exactly one of count / message_ids, within 1..100, ids deduplicated', () => {
+    expect(parseBulkDeleteArgs({ count: 10 })).toEqual({ kind: 'count', count: 10 })
+    expect(() => parseBulkDeleteArgs({})).toThrow(/exactly one/)
+    expect(() => parseBulkDeleteArgs({ count: 5, message_ids: ['123456789012345678'] })).toThrow(/exactly one/)
+    for (const bad of [0, 101, 2.5, '10']) expect(() => parseBulkDeleteArgs({ count: bad })).toThrow(/count must be/)
+    expect(parseBulkDeleteArgs({ message_ids: ['123456789012345678', '123456789012345678', '223456789012345678'] }))
+      .toEqual({ kind: 'ids', ids: ['123456789012345678', '223456789012345678'] })
+    expect(() => parseBulkDeleteArgs({ message_ids: [] })).toThrow(/non-empty/)
+    expect(() => parseBulkDeleteArgs({ message_ids: Array(101).fill('123456789012345678') })).toThrow(/at most 100/)
+    expect(() => parseBulkDeleteArgs({ message_ids: ['nope'] })).toThrow(/message_ids\[0\]/)
+  })
+})
+
+describe('bulk delete 14-day partition', () => {
+  const EPOCH = 1420070400000
+  const idAt = (ms: number) => ((BigInt(ms - EPOCH) << 22n) | 1n).toString()
+
+  test('snowflakeTimestamp matches Discord\'s documented example', () => {
+    expect(snowflakeTimestamp('175928847299117063')).toBe(1462015105796)
+  })
+
+  test('messages at or past 14 days are split out; younger ones are deletable', () => {
+    const now = 1_800_000_000_000
+    const fresh = idAt(now - 60_000)
+    const edge = idAt(now - BULK_DELETE_MAX_AGE_MS)        // exactly 14 days: Discord's bound is strict
+    const old = idAt(now - BULK_DELETE_MAX_AGE_MS - 1000)
+    expect(partitionBulkDeletable([fresh, edge, old], now)).toEqual({ deletable: [fresh], tooOld: [edge, old] })
+  })
+})
+
+describe('admin result formatting — names AND ids present', () => {
+  test('formatMemberRow carries id, names, roles with ids, join date and live timeout only', () => {
+    const now = Date.parse('2026-10-10T00:00:00Z')
+    const row = {
+      id: '700000000000000000', username: 'pindyj', displayName: 'Pindy', nickname: 'pin', bot: false,
+      joinedAt: new Date('2025-01-02T03:04:05Z'), roles: [{ name: 'Member', id: '100000000000000000' }],
+      timedOutUntil: new Date(now + 60_000), isOwner: false,
+    }
+    const out = formatMemberRow(row, now)
+    for (const s of ['id=700000000000000000', 'username="pindyj"', 'display="Pindy"', 'nick="pin"',
+                     'joined=2025-01-02T03:04:05.000Z', 'Member (100000000000000000)', `timed_out_until=${new Date(now + 60_000).toISOString()}`])
+      expect(out).toContain(s)
+    expect(formatMemberRow({ ...row, timedOutUntil: new Date(now - 1) }, now)).toContain('timed_out_until=none')
+  })
+
+  test('formatReactionRows lists emoji, count, users with ids, and how many were not listed', () => {
+    expect(formatReactionRows([])).toBe('(no reactions)')
+    const out = formatReactionRows([
+      { emoji: '👍', count: 3, me: true, users: [{ id: '700000000000000000', username: 'pindyj' }] },
+      { emoji: '<:cow:123456789012345678>', count: 1, me: false },
+    ])
+    expect(out).toContain('reaction[0] emoji=👍 count=3 me=true')
+    expect(out).toContain('pindyj (700000000000000000)')
+    expect(out).toContain('(+2 more)')
+    expect(out).toContain('reaction[1] emoji=<:cow:123456789012345678> count=1')
+  })
+})

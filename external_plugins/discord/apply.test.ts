@@ -138,19 +138,19 @@ describe('applySpecDiff — role ordering', () => {
     expect(out).toContain('drag the bot role up')   // the legible half — the part that was untested
   })
 
-  test('the consent check aborts when the guild changed under the approval, and writes NOTHING', async () => {
+  test('the drift check aborts when the guild changed after the diff was planned, and writes NOTHING', async () => {
     // §6. Zero coverage before this: deleting the whole block left the suite green.
     const diff = orderingDiff(LSS, spec, '500')
-    // A third party inserts a role into the affected band between approval and apply.
+    // A third party inserts a role into the affected band between planning and the write.
     const intruded: StubRole[] = [...LSS, { id: '250', name: 'Intruder', rawPosition: 2, position: 2, managed: false }]
     const { guild, calls } = stubGuild(intruded, { botHighestId: '500' })
     const out = await applySpecDiff(guild, spec, diff)
     expect(out).toContain('✗ reorder role hierarchy')
-    expect(out).toContain('the guild changed since this was approved')
+    expect(out).toContain('the guild changed since this diff was planned')
     expect(calls.length).toBe(0)   // nothing written, which is the whole point
   })
 
-  test('a role already in the approved plan being DRAGGED elsewhere also aborts', async () => {
+  test('a role already in the planned order being DRAGGED elsewhere also aborts', async () => {
     // The first version compared the SET OF NAMES that move, which is blind to a role that was
     // already in that set moving to a different rank -- and since the body is COMPLETE, our own
     // PATCH would then have written the third party's change in as though the owner approved it.
@@ -159,7 +159,7 @@ describe('applySpecDiff — role ordering', () => {
                               : r.name === 'Owner' ? { ...r, rawPosition: 2, position: 2 } : r)
     const { guild, calls } = stubGuild(dragged, { botHighestId: '500' })
     const out = await applySpecDiff(guild, spec, diff)
-    expect(out).toContain('the guild changed since this was approved')
+    expect(out).toContain('the guild changed since this diff was planned')
     expect(calls.length).toBe(0)
   })
 

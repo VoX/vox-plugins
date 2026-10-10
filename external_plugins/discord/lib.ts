@@ -324,7 +324,7 @@ export type RawGuildState = {
   channels: RawChannel[]  // categories included, threads excluded
 }
 
-// Grants of any of these get a ⚠ flag in the approval diff.
+// Grants of any of these get a ⚠ flag in the rendered diff (informational — nothing waits on it).
 export const DANGEROUS_PERMS: readonly string[] = [
   'Administrator', 'ManageGuild', 'ManageRoles', 'ManageChannels',
   'ManageWebhooks', 'KickMembers', 'BanMembers', 'MentionEveryone',
@@ -545,8 +545,8 @@ export type SpecDiffOptions = {
 }
 
 // Large-prune banner: a diff whose delete count exceeds EITHER bound gets a
-// ⚠⚠ line right under the header. Display-only — same single approval —
-// but impossible to miss when a partial spec is about to gut a guild.
+// ⚠⚠ line right under the header. Display-only (there is no approval step
+// since 0.8.6), but impossible to miss in a dry run or in the applied result.
 export const PRUNE_GUARD_MAX_DELETIONS = 5
 export const PRUNE_GUARD_CHANNEL_FRACTION = 0.5
 
@@ -971,9 +971,9 @@ export function computeSpecDiff(current: ServerSpec, desired: ServerSpec, opts: 
   // reorder computed against the guild as it is today would renumber around roles
   // that are about to vanish and miss the ones about to appear.
   //
-  // The result here is for the APPROVAL PROMPT. The applier re-resolves and re-plans
+  // The result here is for the RENDERED DIFF. The applier re-resolves and re-plans
   // against the real guild immediately before writing, because created roles have no
-  // snowflake yet and because an approval can sit for five minutes.
+  // snowflake yet and because the guild can change while the earlier phases run.
   const ordering: SpecDiffEntry[] = []
   const named = namedOrderingConstraints(desired)
   if (named.length > 0) {
@@ -1097,7 +1097,7 @@ function fmtVal(v: unknown): string {
   return String(v)
 }
 
-// Human-readable diff for the owner-approval DM: `+ create`, `~ modify`
+// Human-readable diff returned by apply_server_spec (and its dry run): `+ create`, `~ modify`
 // (before → after), `~ rename`/`~ move`, `- DELETE`, inline ⚠ flags, then
 // the `·` untouched list. A per-op-class breakdown joins the header when the
 // diff renames/moves/deletes (deletions first and loudest), and a diff whose
@@ -1525,7 +1525,7 @@ export type RolePositionInput = { id: string; name: string; rawPosition: number;
 
 /** Roles a spec CREATES have no snowflake at diff time, so the projection gives them placeholders far
  *  above any real id (Discord's reach 9e18 around 2090). The applier needs to tell them apart when it
- *  compares what the owner approved against what it is about to write. */
+ *  compares what the diff planned against what it is about to write. */
 const SYNTHETIC_ID_FLOOR = BigInt('9' + '0'.repeat(18))
 export function isSyntheticRoleId(id: string): boolean {
   return snowflake(id) >= SYNTHETIC_ID_FLOOR
@@ -1827,4 +1827,296 @@ export function explainOrderingRefusal(r: RolePositionRefusal, nameOf: (id: stri
       return `role ordering: ${r.roleIds.map(id => `"${nameOf(id)}"`).join(' → ')} form a cycle — `
         + `each is required to sit above the next`
   }
+}
+
+// ── Admin tools (0.8.6): scoping, permission and hierarchy decisions ─────────────────────────────
+// The pure half of admin.ts. NONE of these tools asks the owner first: at 0.8.6 the owner removed
+// the approval step from every admin tool, apply_server_spec included. What still stands between a
+// call and the guild is (1) the access allowlist, (2) the bot's own Discord permissions and role
+// position, checked here BEFORE the request so the model gets a sentence instead of a bare 50013.
+
+export type AdminScope = 'channel' | 'guild'
+
+/**
+ * Which allow-check governs each admin tool.
+ *
+ * 'channel' — the target channel must pass the SAME outbound check `reply` uses (a `groups` entry for
+ *   it or its thread parent, or a server grant for its guild; a DM needs its peer in allowFrom).
+ * 'guild'   — the guild must have a SERVER grant (`access.guilds[guildId]`). A granted channel inside
+ *   it is not enough: roles, members, bans and channel creation/deletion reach past any one channel,
+ *   so they need the grant whose scope matches theirs. This is the stricter of the two options that
+ *   still works without an approval step; it is opted into per server with
+ *   `/access action:grant scope:server`.
+ *
+ * delete_channel is guild-scoped although it names a channel: it is the one irreversible structural
+ * act, and a channel grant is a grant to TALK somewhere, not to remove it. edit_channel stays
+ * channel-scoped (rename/topic/slowmode on a channel you were granted is in proportion).
+ */
+export const ADMIN_TOOL_SCOPE = {
+  fetch_reactions: 'channel',
+  create_thread: 'channel',
+  delete_message: 'channel',
+  bulk_delete: 'channel',
+  edit_channel: 'channel',
+  get_member: 'guild',
+  list_members: 'guild',
+  create_channel: 'guild',
+  delete_channel: 'guild',
+  add_role: 'guild',
+  remove_role: 'guild',
+  timeout_member: 'guild',
+  kick_member: 'guild',
+  ban_member: 'guild',
+  unban_member: 'guild',
+  set_nickname: 'guild',
+} as const satisfies Record<string, AdminScope>
+export type AdminToolName = keyof typeof ADMIN_TOOL_SCOPE
+
+export function isAdminTool(name: string): name is AdminToolName {
+  return Object.hasOwn(ADMIN_TOOL_SCOPE, name)
+}
+
+/** True only for an own `guilds` entry. A `groups` entry for some channel in the guild does NOT count. */
+export function guildGranted(access: { guilds?: Record<string, GroupPolicyLike> | null }, guildId: string): boolean {
+  return ownEntry(access.guilds, guildId) !== undefined
+}
+
+/**
+ * The guild-scope gate. `guildName` is null when the bot is not in the guild — checked FIRST, so a
+ * grant left behind for a guild the bot has since left can never be acted on.
+ */
+export function adminGuildRefusal(
+  access: { guilds?: Record<string, GroupPolicyLike> | null },
+  guildId: string,
+  guildName: string | null,
+  tool: string,
+): string | null {
+  if (guildName === null) return `bot is not in guild ${guildId}`
+  if (!guildGranted(access, guildId)) {
+    return `${tool} is guild-scoped and ${JSON.stringify(guildName)} (${guildId}) has no server grant. `
+      + `A granted channel is not enough for roles/members/bans/channel create+delete — `
+      + `the owner can opt the server in with /access action:grant scope:server (or /discord:access guild add ${guildId}).`
+  }
+  return null
+}
+
+export type AdminPermContext = { ownMessage?: boolean; self?: boolean; isThread?: boolean }
+
+/** The Discord permissions the BOT must hold for a call. Names are PermissionFlagsBits keys. */
+export function requiredAdminPerms(tool: AdminToolName, ctx: AdminPermContext = {}): string[] {
+  switch (tool) {
+    case 'fetch_reactions': return ['ViewChannel', 'ReadMessageHistory']
+    case 'create_thread': return ['ViewChannel', 'CreatePublicThreads']
+    // Deleting your own message needs nothing; anyone else's needs Manage Messages.
+    case 'delete_message': return ctx.ownMessage ? [] : ['ManageMessages']
+    case 'bulk_delete': return ['ViewChannel', 'ReadMessageHistory', 'ManageMessages']
+    case 'edit_channel': return ctx.isThread ? ['ManageThreads'] : ['ManageChannels']
+    case 'get_member': return []
+    case 'list_members': return []
+    case 'create_channel': return ['ManageChannels']
+    case 'delete_channel': return ctx.isThread ? ['ManageThreads'] : ['ManageChannels']
+    case 'add_role': return ['ManageRoles']
+    case 'remove_role': return ['ManageRoles']
+    case 'timeout_member': return ['ModerateMembers']
+    case 'kick_member': return ['KickMembers']
+    case 'ban_member': return ['BanMembers']
+    case 'unban_member': return ['BanMembers']
+    case 'set_nickname': return ctx.self ? ['ChangeNickname'] : ['ManageNicknames']
+  }
+}
+
+/** null when every needed permission is held. `has` is the bot's effective permission test. */
+export function missingPermsRefusal(needed: readonly string[], has: (perm: string) => boolean, where: string): string | null {
+  const missing = needed.filter(p => !has(p))
+  if (missing.length === 0) return null
+  return `the bot lacks ${missing.join(', ')} ${where} — grant it to the bot's role (Server Settings → Roles), or a channel overwrite that denies it`
+}
+
+/** Grants of these on a role are flagged ⚠ — informational only, nothing waits on them. */
+export function roleDangerousPerms(perms: readonly string[]): string[] {
+  return perms.filter(p => DANGEROUS_PERMS.includes(p))
+}
+
+export type RankedRole = { id: string; name: string; rawPosition: number }
+
+/** Discord's role order: higher raw position wins; on a tie the OLDER (smaller) snowflake ranks higher.
+ *  Same rule as hierarchyOrder above, which the reorder planner uses. */
+export function roleOutranks(a: { id: string; rawPosition: number }, b: { id: string; rawPosition: number }): boolean {
+  if (a.rawPosition !== b.rawPosition) return a.rawPosition > b.rawPosition
+  return snowflake(a.id) < snowflake(b.id)
+}
+
+/** Can the bot add/remove this role at all? Mirrors what Discord enforces. */
+export function roleAssignRefusal(
+  role: RankedRole & { managed: boolean },
+  ctx: { guildId: string; botHighest: RankedRole; botIsGuildOwner: boolean },
+): string | null {
+  if (role.id === ctx.guildId) return '@everyone is held by every member and cannot be added or removed'
+  if (role.managed) return `role ${JSON.stringify(role.name)} (${role.id}) is managed by an integration or bot and cannot be assigned by hand`
+  if (ctx.botIsGuildOwner) return null
+  if (!roleOutranks(ctx.botHighest, role)) {
+    return `role ${JSON.stringify(role.name)} (${role.id}) is at or above the bot's highest role ${JSON.stringify(ctx.botHighest.name)} — `
+      + `Discord only lets a bot assign roles strictly below its own (drag the bot's role above it)`
+  }
+  return null
+}
+
+export type MemberAction = 'timeout' | 'kick' | 'ban' | 'nickname'
+
+const ACTION_VERB: Record<MemberAction, string> = { timeout: 'time out', kick: 'kick', ban: 'ban', nickname: 'change the nickname of' }
+
+/**
+ * Can the bot do `action` to this user? Mirrors discord.js's GuildMember.manageable / moderatable,
+ * which mirror Discord: nobody can act on the guild owner, the bot cannot moderate itself, and the
+ * bot's highest role must strictly outrank the target's — unless the bot owns the guild.
+ * `target.highest` is null when the user is not a member (only a ban works on a non-member, by id).
+ */
+export function memberActionRefusal(
+  action: MemberAction,
+  ctx: { botId: string; guildOwnerId: string; botHighest: RankedRole },
+  target: { id: string; name: string; highest: RankedRole | null; isAdministrator: boolean },
+): string | null {
+  const verb = ACTION_VERB[action]
+  const who = `${JSON.stringify(target.name)} (${target.id})`
+  if (action === 'nickname' && target.id === ctx.botId) return null   // own nickname: ChangeNickname only
+  if (target.id === ctx.guildOwnerId) return `${who} owns the server — nobody can ${verb} the server owner`
+  if (target.id === ctx.botId) return `the bot cannot ${verb} itself`
+  if (target.highest === null) {
+    return action === 'ban' ? null : `${who} is not a member of this server`
+  }
+  if (action === 'timeout' && target.isAdministrator) {
+    return `${who} has Administrator — Discord does not allow timing out administrators`
+  }
+  if (ctx.botId === ctx.guildOwnerId) return null
+  if (!roleOutranks(ctx.botHighest, target.highest)) {
+    return `${who}'s highest role ${JSON.stringify(target.highest.name)} is at or above the bot's ${JSON.stringify(ctx.botHighest.name)} — `
+      + `Discord only lets a bot ${verb} members whose highest role is strictly below its own`
+  }
+  return null
+}
+
+// ── argument validation ──
+
+const SNOWFLAKE_RE = /^\d{15,21}$/
+export function requireSnowflake(v: unknown, field: string): string {
+  const s = typeof v === 'string' ? v.trim() : typeof v === 'number' ? String(v) : ''
+  if (!SNOWFLAKE_RE.test(s)) throw new Error(`${field} must be a Discord id (snowflake), got ${JSON.stringify(v)}`)
+  return s
+}
+
+export function requireName(v: unknown, field: string, max: number): string {
+  if (typeof v !== 'string' || v.trim().length === 0) throw new Error(`${field} is required and must be a non-empty string`)
+  const s = v.trim()
+  if (Array.from(s).length > max) throw new Error(`${field} is ${Array.from(s).length} characters; Discord allows at most ${max}`)
+  return s
+}
+
+/** Discord caps a timeout at 28 days. 0 lifts an existing timeout. Returns milliseconds (null = lift). */
+export const MAX_TIMEOUT_MINUTES = 28 * 24 * 60
+export function timeoutMs(minutes: unknown): number | null {
+  if (typeof minutes !== 'number' || !Number.isFinite(minutes) || minutes < 0 || minutes > MAX_TIMEOUT_MINUTES) {
+    throw new Error(`minutes must be a number from 0 (lift the timeout) to ${MAX_TIMEOUT_MINUTES} (28 days), got ${JSON.stringify(minutes)}`)
+  }
+  return minutes === 0 ? null : Math.round(minutes * 60_000)
+}
+
+export const MAX_BAN_DELETE_SECONDS = 7 * 24 * 60 * 60
+export function banDeleteSeconds(v: unknown): number {
+  if (v === undefined || v === null) return 0
+  if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > MAX_BAN_DELETE_SECONDS) {
+    throw new Error(`delete_message_seconds must be an integer from 0 to ${MAX_BAN_DELETE_SECONDS} (7 days), got ${JSON.stringify(v)}`)
+  }
+  return v
+}
+
+export const MAX_SLOWMODE_SECONDS = 21600
+export function slowmodeSeconds(v: unknown): number {
+  if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > MAX_SLOWMODE_SECONDS) {
+    throw new Error(`slowmode must be an integer number of seconds from 0 to ${MAX_SLOWMODE_SECONDS} (6h), got ${JSON.stringify(v)}`)
+  }
+  return v
+}
+
+/** create_channel's three kinds. apply_server_spec's KIND_TO_TYPE has more, but no 'category'. */
+export function createChannelKind(kind: unknown): ChannelType.GuildText | ChannelType.GuildVoice | ChannelType.GuildCategory {
+  switch (kind) {
+    case 'text': return ChannelType.GuildText
+    case 'voice': return ChannelType.GuildVoice
+    case 'category': return ChannelType.GuildCategory
+  }
+  throw new Error(`kind must be text, voice or category, got ${JSON.stringify(kind)}`)
+}
+
+export const BULK_DELETE_MAX = 100
+export type BulkDeleteTarget = { kind: 'count'; count: number } | { kind: 'ids'; ids: string[] }
+/** Exactly one of count / message_ids. Discord's bulk endpoint takes at most 100 per call. */
+export function parseBulkDeleteArgs(args: { count?: unknown; message_ids?: unknown }): BulkDeleteTarget {
+  const hasCount = args.count !== undefined && args.count !== null
+  const hasIds = args.message_ids !== undefined && args.message_ids !== null
+  if (hasCount === hasIds) throw new Error('pass exactly one of count or message_ids')
+  if (hasCount) {
+    const c = args.count
+    if (typeof c !== 'number' || !Number.isInteger(c) || c < 1 || c > BULK_DELETE_MAX) {
+      throw new Error(`count must be an integer from 1 to ${BULK_DELETE_MAX}, got ${JSON.stringify(c)}`)
+    }
+    return { kind: 'count', count: c }
+  }
+  if (!Array.isArray(args.message_ids) || args.message_ids.length === 0) throw new Error('message_ids must be a non-empty array')
+  if (args.message_ids.length > BULK_DELETE_MAX) throw new Error(`message_ids holds ${args.message_ids.length}; at most ${BULK_DELETE_MAX} per call`)
+  const ids = [...new Set(args.message_ids.map((v, i) => requireSnowflake(v, `message_ids[${i}]`)))]
+  return { kind: 'ids', ids }
+}
+
+const DISCORD_EPOCH = 1420070400000n
+export function snowflakeTimestamp(id: string): number {
+  return Number((BigInt(id) >> 22n) + DISCORD_EPOCH)
+}
+
+/** Discord's bulk-delete endpoint refuses messages older than 14 days (the same bound discord.js uses). */
+export const BULK_DELETE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000
+export function partitionBulkDeletable(ids: readonly string[], now: number): { deletable: string[]; tooOld: string[] } {
+  const deletable: string[] = [], tooOld: string[] = []
+  for (const id of ids) (now - snowflakeTimestamp(id) < BULK_DELETE_MAX_AGE_MS ? deletable : tooOld).push(id)
+  return { deletable, tooOld }
+}
+
+// ── result formatting (one row per thing, newline-joined like fetch_messages / lookup) ──
+
+export type MemberRowInput = {
+  id: string
+  username: string
+  displayName: string
+  nickname: string | null
+  bot: boolean
+  joinedAt: Date | null
+  roles: Array<{ name: string; id: string }>
+  timedOutUntil: Date | null
+  isOwner: boolean
+}
+
+export function formatMemberRow(m: MemberRowInput, now: number): string {
+  const timeout = m.timedOutUntil && m.timedOutUntil.getTime() > now ? m.timedOutUntil.toISOString() : 'none'
+  return `member id=${m.id} username=${JSON.stringify(m.username)} display=${JSON.stringify(m.displayName)}`
+    + (m.nickname ? ` nick=${JSON.stringify(m.nickname)}` : '')
+    + ` bot=${m.bot}${m.isOwner ? ' owner=true' : ''}`
+    + ` joined=${m.joinedAt ? m.joinedAt.toISOString() : 'unknown'}`
+    + ` timed_out_until=${timeout}`
+    + ` roles=${JSON.stringify(m.roles.map(r => `${r.name} (${r.id})`).join(', '))}`
+}
+
+export type ReactionRowInput = {
+  emoji: string
+  count: number
+  me: boolean
+  users?: Array<{ id: string; username: string }>
+}
+
+export function formatReactionRows(rows: readonly ReactionRowInput[]): string {
+  if (rows.length === 0) return '(no reactions)'
+  return rows.map((r, i) => {
+    const users = r.users
+      ? ` users=${JSON.stringify(r.users.map(u => `${u.username} (${u.id})`).join(', '))}${r.users.length < r.count ? ` (+${r.count - r.users.length} more)` : ''}`
+      : ''
+    return `reaction[${i}] emoji=${r.emoji} count=${r.count}${r.me ? ' me=true' : ''}${users}`
+  }).join('\n')
 }

@@ -1,5 +1,5 @@
 /**
- * Apply an approved server-spec diff to a live guild.
+ * Apply a server-spec diff to a live guild.
  *
  * Split out of server.ts so it can be TESTED: server.ts has zero exports and a
  * top-level `await mcp.connect(...)` plus client.login(), so importing it to
@@ -156,7 +156,7 @@ async function applyOverwriteEdits(channel: NonThreadGuildBasedChannel, edits: O
   }
 }
 
-// Apply an approved diff, isolating failures per entry (one hierarchy error
+// Apply a computed diff, isolating failures per entry (one hierarchy error
 // doesn't abort the rest). Entry order from computeSpecDiff is already
 // dependency-ordered: @everyone → roles → categories → channels for
 // creates/updates (so role:<Name> overwrites and parent categories created
@@ -341,10 +341,11 @@ export async function applySpecDiff(guild: Guild, desired: ServerSpec, diff: Spe
  * would PATCH ids that do not exist. So the constraints are re-resolved against the
  * guild as it now stands and the plan is recomputed.
  *
- * That re-plan is also the consent check. What the owner approved is a set of relational
+ * That re-plan is also the drift check. What the diff planned is a set of relational
  * statements and their privilege consequences, not a vector of integers — so cosmetic
- * renumbering between approval and apply is not a reason to abort, but a role appearing
- * or disappearing from the affected band is.
+ * renumbering between planning and the write is not a reason to abort, but a role appearing
+ * or disappearing from the affected band is. (Before 0.8.6 this was the window an owner
+ * approval sat in; the approval is gone but the earlier phases of the apply still run first.)
  */
 async function applyRoleOrdering(
   guild: Guild,
@@ -374,7 +375,7 @@ async function applyRoleOrdering(
     return
   }
 
-  // CONSENT. The owner approved a specific final ORDER, so that is what gets compared -- position by
+  // DRIFT. The diff planned a specific final ORDER, so that is what gets compared -- position by
   // position, by ID.
   //
   // The first version compared the SET OF NAMES that move. Two ways that let real drift through, both
@@ -395,12 +396,12 @@ async function applyRoleOrdering(
         approved.after.find(r => r.id === id)?.name ?? approved.before.find(r => r.id === id)?.name ?? id
       const detail = sameLength
         ? want.map((id, i) => (id !== now[i] && !isSyntheticRoleId(id)
-            ? `rank ${want.length - 1 - i}: approved "${nameOfApproved(id)}", now "${nameOf(now[i]!)}"` : null))
+            ? `rank ${want.length - 1 - i}: planned "${nameOfApproved(id)}", now "${nameOf(now[i]!)}"` : null))
             .filter(Boolean).slice(0, 4).join('; ')
-        : `${want.length} role(s) approved, ${now.length} now`
+        : `${want.length} role(s) planned, ${now.length} now`
       throw new Error(
-        `role ordering: the guild changed since this was approved — ${detail}. Nothing was written. `
-        + `Re-run apply_server_spec to review the current state.`)
+        `role ordering: the guild changed since this diff was planned — ${detail}. Nothing was written. `
+        + `Re-run apply_server_spec (dry_run first) against the current state.`)
     }
   }
 
