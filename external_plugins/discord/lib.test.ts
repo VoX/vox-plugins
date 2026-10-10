@@ -5,7 +5,8 @@ import {
   buildServerSpec, computeSpecDiff, renderSpecDiff, overwriteEditMap, grantGroup, removeGroup, makeTtlCache,
   normalizeLookupQuery, clampLookupLimit, lookupNameMatches, lookupRank,
   grantDm, removeDm, resolveById,
-  parseAccess, defaultAccess, resolveChannelPolicy, channelAllowed, groupGateVerdict,
+  parseAccess, serializeAccess, defaultAccess, resolveChannelPolicy, channelAllowed, groupGateVerdict,
+  channelRefOf, channelGrantKey, resolvePermissionReply,
   planRolePositions,
   resolveOrderingConstraints,
   namedOrderingConstraints,
@@ -1025,10 +1026,6 @@ describe('lookup query normalisation (every case here is a defect review found i
   })
 })
 
-// ── DM access (/access user:@someone) ──
-// The owner asked for /access to authorise DM conversations as well as channels (2026-08-21). The
-// handler is owner-gated in server.ts; what is testable is the state transition, so that is what these
-// pin. Mirrors the grantGroup/removeGroup tests above.
 // ── server-wide (guild) grants ──
 // Snowflakes: guild G1 holds channels C_LISTED (own entry), C_NEW (no entry, e.g. created after the
 // grant) and thread T (parent C_NEW). G2 is a guild nobody granted, holding C_OTHER.
@@ -1218,6 +1215,119 @@ describe('channelAllowed — the outbound check (reply/react/edit/fetch go throu
   })
 })
 
+describe('channelRefOf / channelGrantKey — the lookup key the gate, outbound check and /access share', () => {
+  // Plain objects shaped like discord.js channels: isThread() is a method, guildId absent on DMs.
+  const textCh = (id: string, guildId: string, categoryId: string | null = null) =>
+    ({ id, guildId, parentId: categoryId, isThread: () => false })
+  const threadCh = (id: string, parentId: string | null, guildId: string) =>
+    ({ id, guildId, parentId, isThread: () => true })
+  const dmCh = (id: string) => ({ id, isThread: () => false })
+
+  test('a text channel keys on itself and carries its guild', () => {
+    const ref = channelRefOf(textCh(C_NEW, G1))
+    expect(ref).toEqual({ id: C_NEW, isThread: false, parentId: null, guildId: G1 })
+    expect(channelGrantKey(ref)).toBe(C_NEW)
+  })
+
+  test("a text channel's parentId is its CATEGORY and is dropped — a granted category id grants nothing", () => {
+    const CATEGORY = '5000000000000000001'
+    const ref = channelRefOf(textCh(C_NEW, G2, CATEGORY))
+    expect(ref.parentId).toBeNull()
+    expect(channelGrantKey(ref)).toBe(C_NEW)
+    expect(channelAllowed({ groups: { [CATEGORY]: { requireMention: true, allowFrom: [] } } }, ref)).toBe(false)
+  })
+
+  test('a thread keys on its parent', () => {
+    const ref = channelRefOf(threadCh(T, C_LISTED, G1))
+    expect(ref).toEqual({ id: T, isThread: true, parentId: C_LISTED, guildId: G1 })
+    expect(channelGrantKey(ref)).toBe(C_LISTED)
+  })
+
+  test('a thread with no known parent keys on itself', () => {
+    expect(channelGrantKey(channelRefOf(threadCh(T, null, G1)))).toBe(T)
+  })
+
+  test('a DM-shaped channel gets guildId null', () => {
+    expect(channelRefOf(dmCh(C_NEW)).guildId).toBeNull()
+  })
+
+  const granted = { groups: {}, guilds: { [G1]: { requireMention: true, allowFrom: [] } } }
+
+  test('end to end: a channel and a thread in the granted guild are allowed', () => {
+    expect(channelAllowed(granted, channelRefOf(textCh(C_NEW, G1)))).toBe(true)
+    expect(channelAllowed(granted, channelRefOf(threadCh(T, C_NEW, G1)))).toBe(true)
+  })
+
+  test('a WRONG guildId fails — same channel id, other guild', () => {
+    expect(channelAllowed(granted, channelRefOf(textCh(C_NEW, G2)))).toBe(false)
+    expect(channelAllowed(granted, channelRefOf(threadCh(T, C_NEW, G2)))).toBe(false)
+  })
+
+  test('a MISSING guildId fails — the guild map is never consulted', () => {
+    expect(channelAllowed(granted, channelRefOf(dmCh(C_NEW)))).toBe(false)
+    expect(channelAllowed(granted, channelRefOf({ id: C_NEW, guildId: null, isThread: () => false }))).toBe(false)
+  })
+})
+
+describe('serializeAccess — an empty guilds map is not written back', () => {
+  const OLD = { dmPolicy: 'allowlist', allowFrom: [ALICE], groups: { [C_LISTED]: { requireMention: false, allowFrom: [] } }, pending: {} }
+
+  test('load + save of a pre-0.8.5 file adds no `guilds` key and changes nothing else', () => {
+    const out = serializeAccess(parseAccess(JSON.stringify(OLD)))
+    expect('guilds' in JSON.parse(out)).toBe(false)
+    expect(JSON.parse(out)).toEqual(OLD)
+    expect(out.endsWith('\n')).toBe(true)
+  })
+
+  test('a non-empty guilds map is kept', () => {
+    const a = parseAccess(JSON.stringify(OLD))
+    grantGroup(a.guilds!, G1, true)
+    expect(JSON.parse(serializeAccess(a)).guilds).toEqual({ [G1]: { requireMention: true, allowFrom: [] } })
+  })
+
+  test('removing the last guild entry drops the key again', () => {
+    const a = parseAccess(JSON.stringify({ ...OLD, guilds: { [G1]: { requireMention: true, allowFrom: [] } } }))
+    removeGroup(a.guilds!, G1)
+    expect('guilds' in JSON.parse(serializeAccess(a))).toBe(false)
+  })
+
+  test('save then load round-trips', () => {
+    const a = parseAccess(JSON.stringify({ ...OLD, guilds: { [G1]: { requireMention: false, allowFrom: [BOB] } } }))
+    expect(parseAccess(serializeAccess(a))).toEqual(a)
+  })
+})
+
+describe('resolvePermissionReply — typed "yes <code>" only from the top-level allowFrom', () => {
+  const pending = ['abcde', 'QxYzW']
+
+  test('an allowFrom sender approves or denies a pending request', () => {
+    expect(resolvePermissionReply('yes abcde', pending, ALICE, [ALICE])).toEqual({ requestId: 'abcde', behavior: 'allow' })
+    expect(resolvePermissionReply('n abcde', pending, ALICE, [ALICE])).toEqual({ requestId: 'abcde', behavior: 'deny' })
+  })
+
+  test('a sender who passed the gate but is NOT in allowFrom is ignored — their message is plain chat', () => {
+    expect(resolvePermissionReply('yes abcde', pending, BOB, [ALICE])).toBeUndefined()
+    expect(resolvePermissionReply('yes abcde', pending, BOB, [])).toBeUndefined()
+  })
+
+  test('the request must actually be pending ("no tests" is just English)', () => {
+    expect(resolvePermissionReply('no tests', pending, ALICE, [ALICE])).toBeUndefined()
+  })
+
+  test('matched case-insensitively, reported with the STORED id', () => {
+    expect(resolvePermissionReply('YES qxyzw', pending, ALICE, [ALICE])).toEqual({ requestId: 'QxYzW', behavior: 'allow' })
+  })
+
+  test('chatter around the code is not a reply', () => {
+    expect(resolvePermissionReply('yes abcde please', pending, ALICE, [ALICE])).toBeUndefined()
+    expect(resolvePermissionReply('yes', pending, ALICE, [ALICE])).toBeUndefined()
+  })
+})
+
+// ── DM access (/access user:@someone) ──
+// The owner asked for /access to authorise DM conversations as well as channels (2026-08-21). The
+// handler is owner-gated in server.ts; what is testable is the state transition, so that is what these
+// pin. Mirrors the grantGroup/removeGroup tests above.
 describe('grantDm / removeDm', () => {
   test('grant adds the user to allowFrom', () => {
     const allow: string[] = []

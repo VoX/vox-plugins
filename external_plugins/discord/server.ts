@@ -47,7 +47,7 @@ import { join, sep, dirname } from 'path'
 import sharp from 'sharp'
 import { snapshotGuild, applySpecDiff } from './apply'
 import { orderingCrossings, planRolePositions } from './lib'
-import { normalizeLookupQuery, clampLookupLimit, lookupNameMatches, lookupRank, safeSlice, formatSendResult, chunk, buildEmbedFromArgs, EMBED_SCHEMA_PROPS, PRESENCE_IDLE, isIdle, composePresence, withContextPrefix, buildServerSpec, computeSpecDiff, renderSpecDiff, grantGroup, removeGroup, resolveChannelPolicy, channelAllowed, groupGateVerdict, parseAccess, defaultAccess, type Access, grantDm, removeDm, resolveById, makeTtlCache, DANGEROUS_PERMS, PRUNE_GUARD_MAX_DELETIONS, PRUNE_GUARD_CHANNEL_FRACTION, type ServerSpec, type SpecDiff } from './lib'
+import { normalizeLookupQuery, clampLookupLimit, lookupNameMatches, lookupRank, safeSlice, formatSendResult, chunk, buildEmbedFromArgs, EMBED_SCHEMA_PROPS, PRESENCE_IDLE, isIdle, composePresence, withContextPrefix, buildServerSpec, computeSpecDiff, renderSpecDiff, grantGroup, removeGroup, resolveChannelPolicy, channelAllowed, channelRefOf, channelGrantKey, groupGateVerdict, parseAccess, serializeAccess, defaultAccess, resolvePermissionReply, type Access, grantDm, removeDm, resolveById, makeTtlCache, DANGEROUS_PERMS, PRUNE_GUARD_MAX_DELETIONS, PRUNE_GUARD_CHANNEL_FRACTION, type ServerSpec, type SpecDiff } from './lib'
 
 // Opt-in gate. Plugin is inert unless VOX_PLUGINS_ENABLED=1 is set in the
 // environment (only our systemd service sets it). Fresh claude CLI sessions
@@ -427,11 +427,7 @@ process.on('uncaughtException', err => {
   process.stderr.write(`discord channel: uncaught exception: ${err}\n`)
 })
 
-// Permission-reply spec from anthropics/claude-cli-internal
-// src/services/mcp/channelPermissions.ts — inlined (no CC repo dep).
-// 5 lowercase letters a-z minus 'l'. Case-insensitive for phone autocorrect.
-// Strict: no bare yes/no (conversational), no prefix/suffix chatter.
-const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
+// PERMISSION_REPLY_RE and the decision built on it live in lib.ts (resolvePermissionReply).
 
 const client = new Client({
   intents: [
@@ -534,7 +530,7 @@ function saveAccess(a: Access): void {
   if (STATIC) return
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
   const tmp = ACCESS_FILE + '.tmp'
-  writeFileSync(tmp, JSON.stringify(a, null, 2) + '\n', { mode: 0o600 })
+  writeFileSync(tmp, serializeAccess(a), { mode: 0o600 })
   renameSync(tmp, ACCESS_FILE)
 }
 
@@ -657,12 +653,7 @@ async function gate(msg: Message): Promise<GateResult> {
   // `guilds` entry for msg.guildId covers it — including channels and threads created after the
   // grant. The reply still goes to msg.channelId (the thread); this is only the gate lookup.
   // resolveChannelPolicy is shared with fetchAllowedChannel so inbound and outbound cannot disagree.
-  const resolved = resolveChannelPolicy(access, {
-    id: msg.channelId,
-    isThread: msg.channel.isThread(),
-    parentId: msg.channel.isThread() ? msg.channel.parentId : null,
-    guildId: msg.guildId,
-  })
+  const resolved = resolveChannelPolicy(access, channelRefOf(msg.channel))
   const verdict = groupGateVerdict(resolved?.policy, senderId)
   if (verdict === 'drop') return { action: 'drop' }
   if (verdict === 'needs-mention' && !(await isMentioned(msg, access.mentionPatterns))) {
@@ -769,13 +760,7 @@ async function fetchAllowedChannel(id: string) {
     const userId = ch.recipientId ?? dmChannelUsers.get(id)
     if (userId && access.allowFrom.includes(userId)) return ch
   } else {
-    const ref = {
-      id: ch.id,
-      isThread: ch.isThread(),
-      parentId: ch.isThread() ? ch.parentId : null,
-      guildId: 'guildId' in ch ? ch.guildId : null,
-    }
-    if (channelAllowed(access, ref)) return ch
+    if (channelAllowed(access, channelRefOf(ch))) return ch
   }
   throw new Error(`channel ${id} is not allowlisted — add via /discord:access`)
 }
@@ -3459,33 +3444,45 @@ client.on('interactionCreate', async (interaction: Interaction) => {
         return
       }
 
+      // A thread inherits its parent's grant, and the resolver never reads a thread's own key — so a
+      // grant typed inside a thread (or naming one) goes on the PARENT, through the same channelGrantKey
+      // the resolver uses. Writing it under the thread id would be an inert entry that `list` shows as
+      // granted. If the channel cannot be fetched, fall back to the id as given (the old behaviour).
+      const target = await client.channels.fetch(channelId).catch(() => null)
+      const grantKey = target ? channelGrantKey(channelRefOf(target)) : channelId
+      const viaThread = grantKey !== channelId ? ` (thread <#${channelId}> → its parent channel)` : ''
+
       if (action === 'grant') {
         const requireMention = interaction.options.getBoolean('mentions_only') ?? true
         const overridesGuild = await withAccessLock(() => {
           const access = loadAccess()
-          grantGroup(access.groups, channelId, requireMention)
+          grantGroup(access.groups, grantKey, requireMention)
           saveAccess(access)
           return interaction.guildId != null && access.guilds?.[interaction.guildId] != null
         })
         await interaction.reply({
-          content: `✅ granted <#${channelId}> — requireMention: ${requireMention}` +
+          content: `✅ granted <#${grantKey}>${viaThread} — requireMention: ${requireMention}` +
             (overridesGuild ? `\nthis channel's entry now overrides the server-wide grant here.` : ''),
           flags: MessageFlags.Ephemeral,
         }).catch(() => {})
       } else if (action === 'remove') {
         const result = await withAccessLock(() => {
           const access = loadAccess()
-          const had = removeGroup(access.groups, channelId)
-          if (had) saveAccess(access)
+          const had = removeGroup(access.groups, grantKey)
+          // A pre-0.8.5 grant typed inside this thread was stored under the thread id and never read;
+          // clear it too, so removing from the thread leaves nothing behind that `list` still shows.
+          const hadInert = grantKey !== channelId && removeGroup(access.groups, channelId)
+          if (had || hadInert) saveAccess(access)
           // A server-wide grant still covers this channel after its own entry is gone. Without this the
           // reply says "removed" while the bot keeps listening here.
           const guildPolicy = interaction.guildId ? access.guilds?.[interaction.guildId] : undefined
           return { had, guildPolicy }
         })
         await interaction.reply({
-          content: (result.had ? `🚫 removed <#${channelId}> from granted channels` : `<#${channelId}> wasn't granted — nothing to remove`) +
+          content: (result.had ? `🚫 removed <#${grantKey}>${viaThread} from granted channels` : `<#${grantKey}>${viaThread} wasn't granted — nothing to remove`) +
             (result.guildPolicy
-              ? `\n⚠️ still covered by the server-wide grant (requireMention: ${result.guildPolicy.requireMention ?? true}) — remove that with \`scope:server\`, or /dunk this channel.`
+              ? `\n⚠️ still covered by the server-wide grant (requireMention: ${result.guildPolicy.requireMention ?? true}) — I still hear AND can post here. ` +
+                `remove that with \`scope:server\`; /dunk only quiets inbound.`
               : ''),
           flags: MessageFlags.Ephemeral,
         }).catch(() => {})
@@ -3687,19 +3684,18 @@ async function handleInbound(msg: Message): Promise<void> {
   // Matched case-insensitively but reported with the STORED id: request_id is whatever the harness
   // gave us and is echoed back verbatim, so lowercasing it before sending would break a real reply
   // to any id that is not already lower case.
-  const permMatch = PERMISSION_REPLY_RE.exec(msg.content)
-  let permRequestId: string | undefined
-  if (permMatch) {
-    const typed = permMatch[1] ? permMatch[2]!.toLowerCase() : undefined
-    if (typed) for (const id of pendingPermissions.keys()) if (id.toLowerCase() === typed) { permRequestId = id; break }
-  }
+  //
+  // And only from the top-level allowFrom — the same people the Allow/Deny buttons accept. Passing
+  // gate() is NOT enough: a channel entry with an empty allowFrom, or a whole-server grant, admits
+  // everyone who can post there. Anyone else's "yes abcde" is delivered as ordinary chat.
+  const permReply = resolvePermissionReply(msg.content, pendingPermissions.keys(), msg.author.id, result.access.allowFrom)
 
   // Log authorized inbound (incl. while dunked) BEFORE the dunk gate, which governs
   // delivery only; the body is built here only when logging, then reused for delivery
   // below. Permission-reply tokens ("yes <code>") are control messages — skip them.
   // Only REAL ones: a message that merely looks like one is ordinary chat and belongs in the log.
   let body: { content: string; atts: string[] } | undefined
-  if (MESSAGE_LOG && permRequestId === undefined) {
+  if (MESSAGE_LOG && permReply === undefined) {
     body = await buildInboundBody(msg)
     logMessage({
       chat_id,
@@ -3725,22 +3721,19 @@ async function handleInbound(msg: Message): Promise<void> {
   }
 
 
-  // Permission-reply intercept: if this looks like "yes xxxxx" for a
-  // pending permission request, emit the structured event instead of
-  // relaying as chat. The sender is already gate()-approved at this point
-  // (non-allowlisted senders were dropped above), so we trust the reply.
-  // permMatch/permRequestId are resolved above, before the log gate, so both agree on what counts
-  // as a control message. No pending request with that id -> this is just someone talking.
-  if (permMatch && permRequestId !== undefined) {
+  // Permission-reply intercept: "yes xxxxx" for a pending request, from a sender in the top-level
+  // allowFrom, emits the structured event instead of relaying as chat. gate() approval alone is not
+  // trusted for this (see above). permReply is resolved before the log gate, so both agree on what
+  // counts as a control message; undefined -> this is just someone talking.
+  if (permReply !== undefined) {
     void mcp.notification({
       method: 'notifications/claude/channel/permission',
       params: {
-        request_id: permRequestId,
-        behavior: permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny',
+        request_id: permReply.requestId,
+        behavior: permReply.behavior,
       },
     })
-    const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? '✅' : '❌'
-    void msg.react(emoji).catch(() => {})
+    void msg.react(permReply.behavior === 'allow' ? '✅' : '❌').catch(() => {})
     return
   }
 

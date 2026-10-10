@@ -45,7 +45,10 @@ Read both state files and give the user a complete picture:
    - DM policy and what it means in one line
    - Allowed senders: count, and list display names or snowflakes
    - Pending pairings: count, with codes and display names if any
-   - Guild channels opted in: count
+   - Guild channels opted in: count (`groups`)
+   - Servers opted in: count (`guilds`, absent = none) — a server grant
+     reaches EVERY channel and thread in that server, present and future, so
+     list each one by id and say so; it is the widest grant there is
 
 3. **What next** — end with a concrete next step based on state:
    - No token → *"Run `/discord:configure <token>` with your bot token from

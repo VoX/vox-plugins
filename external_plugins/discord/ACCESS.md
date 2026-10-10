@@ -69,9 +69,11 @@ To cover every channel in a server — including channels and threads created la
 /discord:access guild rm 1155098001112342528
 ```
 
-Lookup order for a message in a guild channel: the channel's own `groups` entry (a thread uses its parent channel's), then its server's `guilds` entry, then drop. **A channel entry wins outright** — fields are not merged — so you can make one channel stricter or looser than the server default by giving it its own entry. Removing a channel's entry does *not* exclude it from a granted server; to quiet one channel inside a granted server, give it a stricter entry (e.g. `--allow` a single ID) or `/dunk` it.
+Lookup order for a message in a guild channel: the channel's own `groups` entry (a thread uses its parent channel's), then its server's `guilds` entry, then drop. **A channel entry wins outright** — fields are not merged — so you can make one channel stricter or looser than the server default by giving it its own entry. Removing a channel's entry does *not* exclude it from a granted server.
 
-The outbound tools (`reply`, `react`, `edit_message`, `fetch_messages`, …) follow the same lookup, so any channel the bot can hear in a granted server is one it can answer in. A server entry's `allowFrom` and `requireMention` are inbound rules only.
+The outbound tools (`reply`, `react`, `edit_message`, `fetch_messages`, `download_attachment`, …) follow the same lookup, so any channel the bot can hear in a granted server is one it can post in, read history from, and react in. `allowFrom` and `requireMention` — on a server entry or a channel entry — are inbound rules only.
+
+**A server grant has no per-channel exclusion, and nothing quiets the outbound side.** A stricter channel entry (`--allow` a single ID) or `/dunk` can quiet what the bot *hears* in one channel, but neither stops it *sending* there: the channel is still granted, so `reply`, `react`, `fetch_messages` and the rest still work in it. If a server has a channel the bot must not touch at all, don't grant the server — grant its channels one by one instead.
 
 ## The /access slash command
 

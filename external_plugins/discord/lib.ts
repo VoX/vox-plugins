@@ -1172,6 +1172,36 @@ export function renderSpecDiff(diff: SpecDiff): string {
   return lines.join('\n')
 }
 
+// ── typed permission replies ("yes abcde") ──
+// Permission-reply spec from anthropics/claude-cli-internal
+// src/services/mcp/channelPermissions.ts — inlined (no CC repo dep).
+// 5 lowercase letters a-z minus 'l'. Case-insensitive for phone autocorrect.
+// Strict: no bare yes/no (conversational), no prefix/suffix chatter.
+export const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
+
+// A typed reply counts ONLY from a sender in the top-level allowFrom — the same people the Allow/Deny
+// buttons accept. Passing the inbound gate is not enough: a channel entry with an empty allowFrom, and
+// since 0.8.5 a whole-server grant, admits everyone who can post there, and any of them could otherwise
+// approve a tool call. Anything that does not qualify returns undefined and is delivered as ordinary chat.
+//
+// The request must also actually be pending ("no tests" is `no` + five letters), and is reported with
+// the STORED id: request ids are echoed back verbatim, so lowercasing would break a mixed-case one.
+export function resolvePermissionReply(
+  content: string,
+  pendingIds: Iterable<string>,
+  senderId: string,
+  allowFrom: readonly string[],
+): { requestId: string; behavior: 'allow' | 'deny' } | undefined {
+  if (!allowFrom.includes(senderId)) return undefined
+  const m = PERMISSION_REPLY_RE.exec(content)
+  if (!m) return undefined
+  const typed = m[2]!.toLowerCase()
+  for (const id of pendingIds) {
+    if (id.toLowerCase() === typed) return { requestId: id, behavior: m[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny' }
+  }
+  return undefined
+}
+
 // ── /access slash-command mutations (pure; operate on access.json groups OR guilds — same policy
 // shape, so a server-wide grant reuses these with the guild id as the key) ──
 export type GroupPolicyLike = { requireMention: boolean; allowFrom: string[] }
@@ -1244,6 +1274,15 @@ export function parseAccess(raw: string): Access {
   return { ...defaultAccess(), ...parsed }
 }
 
+// The on-disk form. An EMPTY `guilds` map is left out, so loading and saving a pre-0.8.5 file does not
+// add a key nobody asked for (the /discord:access skill says the same: add it with the first entry).
+// An absent key and `{}` read identically, so dropping it loses nothing.
+export function serializeAccess(a: Access): string {
+  const { guilds, ...rest } = a
+  const keepGuilds = guilds != null && typeof guilds === 'object' && Object.keys(guilds).length > 0
+  return JSON.stringify(keepGuilds ? a : rest, null, 2) + '\n'
+}
+
 // ── which policy governs a guild channel ──
 // ONE function for inbound (gate) and outbound (fetchAllowedChannel). They used to compute this
 // separately, and a server-wide grant added to only one side is the exact failure mode: inbound
@@ -1265,6 +1304,20 @@ export type ResolvedChannelPolicy = {
   key: string
 }
 
+// Build a ChannelRef from a discord.js channel. Shared by the inbound gate, the outbound check and the
+// /access handler, so all three derive the thread→parent mapping and the guild id the same way.
+// Structural, so it is testable with plain objects; DM channels have no guildId and get null.
+export function channelRefOf(ch: { id: string; isThread(): boolean; parentId?: string | null; guildId?: string | null }): ChannelRef {
+  const isThread = ch.isThread()
+  return { id: ch.id, isThread, parentId: isThread ? ch.parentId ?? null : null, guildId: ch.guildId ?? null }
+}
+
+// The `groups` key a channel is granted under: a thread uses its parent (threads inherit), anything
+// else its own id. A thread whose parent is unknown falls back to its own id.
+export function channelGrantKey(ch: ChannelRef): string {
+  return ch.isThread ? ch.parentId ?? ch.id : ch.id
+}
+
 // Own-property lookup that tolerates a missing or null map (a hand-edited `"guilds": null`).
 function ownEntry<T>(rec: Record<string, T> | null | undefined, key: string): T | undefined {
   if (!rec || typeof rec !== 'object' || !Object.hasOwn(rec, key)) return undefined
@@ -1277,7 +1330,7 @@ export function resolveChannelPolicy(
   access: { groups?: Record<string, GroupPolicyLike> | null; guilds?: Record<string, GroupPolicyLike> | null },
   ch: ChannelRef,
 ): ResolvedChannelPolicy | undefined {
-  const key = ch.isThread ? ch.parentId ?? ch.id : ch.id
+  const key = channelGrantKey(ch)
   const own = ownEntry(access.groups, key)
   if (own) return { policy: own, source: 'channel', key }
   if (ch.guildId) {
