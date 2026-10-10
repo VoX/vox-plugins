@@ -2025,8 +2025,10 @@ describe('admin argument validation', () => {
   test('timeoutMs: 0 lifts, minutes become ms, 28 days is the ceiling', () => {
     expect(timeoutMs(0)).toBeNull()
     expect(timeoutMs(60)).toBe(3_600_000)
-    expect(timeoutMs(MAX_TIMEOUT_MINUTES)).toBe(28 * 24 * 3_600_000)
-    for (const bad of [MAX_TIMEOUT_MINUTES + 1, -1, NaN, Infinity, '5', undefined])
+    // a minute UNDER 28 days: Discord measures the cap against its own clock when the request lands
+    expect(MAX_TIMEOUT_MINUTES).toBe(40319)
+    expect(timeoutMs(MAX_TIMEOUT_MINUTES)).toBe(28 * 24 * 3_600_000 - 60_000)
+    for (const bad of [28 * 24 * 60, MAX_TIMEOUT_MINUTES + 1, -1, NaN, Infinity, '5', undefined])
       expect(() => timeoutMs(bad)).toThrow(/minutes must be/)
   })
 
@@ -2104,5 +2106,49 @@ describe('admin result formatting — names AND ids present', () => {
     expect(out).toContain('pindyj (700000000000000000)')
     expect(out).toContain('(+2 more)')
     expect(out).toContain('reaction[1] emoji=<:cow:123456789012345678> count=1')
+  })
+})
+
+// ── 0.8.6: the deletion self-check that stands in for owner approval on apply_server_spec ──
+import { deletionConfirmRefusal, countDeletions, type SpecDiff as _SpecDiff } from './lib'
+
+describe('deletionConfirmRefusal — confirm_deletions must equal the diff\'s deletion count', () => {
+  const del = (kind: 'role' | 'category' | 'channel', id: string) => ({ kind, op: 'delete' as const, name: `x${id}`, id, changes: [], dangerous: [] })
+  const prune: _SpecDiff = {
+    entries: [
+      { kind: 'role', op: 'create', name: 'New', changes: [], dangerous: [] },
+      del('channel', '1'), del('category', '2'), del('role', '3'),
+      { kind: 'ordering', op: 'reorder', name: 'role hierarchy', changes: [], dangerous: [] },
+    ],
+    untouched: [],
+  }
+  const additive: _SpecDiff = { entries: [{ kind: 'role', op: 'create', name: 'New', changes: [], dangerous: [] }], untouched: [] }
+
+  test('counts deletes only — not creates, not a reorder', () => {
+    expect(countDeletions(prune)).toBe(3)
+    expect(countDeletions(additive)).toBe(0)
+  })
+
+  test('a deleting diff with no confirm_deletions is refused, and the refusal states the count to confirm', () => {
+    for (const missing of [undefined, null]) {
+      const r = deletionConfirmRefusal(prune, missing)
+      expect(r).toContain('DELETE 3')
+      expect(r).toContain('confirm_deletions: 3')
+      expect(r).toContain('Nothing was applied')
+    }
+  })
+
+  test('the wrong count is refused — off by one either way, a string, a boolean', () => {
+    for (const wrong of [2, 4, '3', true, 3.0001]) expect(deletionConfirmRefusal(prune, wrong)).toContain('but this diff deletes 3')
+  })
+
+  test('the exact count passes', () => {
+    expect(deletionConfirmRefusal(prune, 3)).toBeNull()
+  })
+
+  test('a diff that deletes nothing needs no confirm — but a stale non-zero count is still refused', () => {
+    expect(deletionConfirmRefusal(additive, undefined)).toBeNull()
+    expect(deletionConfirmRefusal(additive, 0)).toBeNull()
+    expect(deletionConfirmRefusal(additive, 2)).toContain('but this diff deletes 0')
   })
 })

@@ -550,6 +550,30 @@ export type SpecDiffOptions = {
 export const PRUNE_GUARD_MAX_DELETIONS = 5
 export const PRUNE_GUARD_CHANNEL_FRACTION = 0.5
 
+export function countDeletions(diff: SpecDiff): number {
+  return diff.entries.filter(e => e.op === 'delete').length
+}
+
+/**
+ * The deletion self-check that replaced owner approval (0.8.6). A real apply whose diff DELETES anything
+ * must carry confirm_deletions equal to the exact number of deletions this diff computes — a number the
+ * caller can only know by having read a dry run of the same diff. Not an approval: nobody else is asked.
+ * A count that does not match is refused even when the diff deletes nothing, because a mismatch means
+ * the spec or the guild changed since the dry run that number came from.
+ */
+export function deletionConfirmRefusal(diff: SpecDiff, confirm: unknown): string | null {
+  const dels = countDeletions(diff)
+  const given = confirm === undefined || confirm === null ? null : confirm
+  if (dels === 0 && given === null) return null
+  if (given === dels) return null
+  if (given === null) {
+    return `refused: this apply would DELETE ${dels} entit${dels === 1 ? 'y' : 'ies'} and carries no confirm_deletions. `
+      + `Nothing was applied. Read the diff below (it is the dry run); if every deletion is intended, re-call with confirm_deletions: ${dels}.`
+  }
+  return `refused: confirm_deletions is ${JSON.stringify(given)} but this diff deletes ${dels}. Nothing was applied — `
+    + `the spec or the guild changed since the dry run that number came from. Read the diff below and confirm the count it shows.`
+}
+
 // The boolean map permissionOverwrites.edit takes, built to CONVERGE on the
 // desired overwrite: desired allow → true, desired deny → false, and any perm
 // currently set on the overwrite but absent from the spec → null (unset).
@@ -2011,11 +2035,13 @@ export function requireName(v: unknown, field: string, max: number): string {
   return s
 }
 
-/** Discord caps a timeout at 28 days. 0 lifts an existing timeout. Returns milliseconds (null = lift). */
-export const MAX_TIMEOUT_MINUTES = 28 * 24 * 60
+/** Discord caps a timeout at 28 days, measured against ITS clock when the request lands — so a full 28
+ *  days computed here is already over by the time it arrives. One minute under. 0 lifts a timeout.
+ *  Returns milliseconds (null = lift). */
+export const MAX_TIMEOUT_MINUTES = 28 * 24 * 60 - 1
 export function timeoutMs(minutes: unknown): number | null {
   if (typeof minutes !== 'number' || !Number.isFinite(minutes) || minutes < 0 || minutes > MAX_TIMEOUT_MINUTES) {
-    throw new Error(`minutes must be a number from 0 (lift the timeout) to ${MAX_TIMEOUT_MINUTES} (28 days), got ${JSON.stringify(minutes)}`)
+    throw new Error(`minutes must be a number from 0 (lift the timeout) to ${MAX_TIMEOUT_MINUTES} (a minute under 28 days), got ${JSON.stringify(minutes)}`)
   }
   return minutes === 0 ? null : Math.round(minutes * 60_000)
 }

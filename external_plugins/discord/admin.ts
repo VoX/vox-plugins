@@ -40,6 +40,7 @@ import {
   createChannelKind,
   formatMemberRow,
   formatReactionRows,
+  guildGranted,
   memberActionRefusal,
   missingPermsRefusal,
   parseBulkDeleteArgs,
@@ -212,7 +213,7 @@ export const ADMIN_TOOL_DEFS: Array<{ name: AdminToolName; description: string; 
   },
   {
     name: 'timeout_member',
-    description: 'Time a member out for `minutes` (max 40320 = 28 days); 0 lifts an existing timeout. Administrators, the server owner and members at or above the bot\'s role cannot be timed out. Applies immediately. Guild-scoped: the server needs a server grant.',
+    description: 'Time a member out for `minutes` (max 40319, a minute under 28 days); 0 lifts an existing timeout. Administrators, the server owner and members at or above the bot\'s role cannot be timed out. Applies immediately. Guild-scoped: the server needs a server grant.',
     inputSchema: {
       type: 'object',
       properties: { guild_id: { type: 'string' }, user_id: { type: 'string' }, minutes: { type: 'number' }, reason: REASON },
@@ -493,17 +494,22 @@ async function dispatch(tool: AdminToolName, args: Record<string, unknown>, deps
       if (deletable.length === 0) {
         throw new Error(`all ${tooOld.length} message(s) are older than 14 days; Discord refuses to bulk-delete those — use delete_message one at a time`)
       }
-      // filterOld=true re-applies the 14-day bound inside discord.js, in case the clock moved between.
-      const deleted = await ch.bulkDelete(deletable, true)
-      const deletedIds = [...deleted.keys()]
+      // filterOld=false: the partition above already applied the 14-day bound, and a second filter here
+      // could drop ids silently. What a successful call returns is NOT the deleted set: with exactly one
+      // id, discord.js deletes it singly and returns an EMPTY collection when that message was never
+      // cached. The call either throws or deleted what it was sent, so success means all of `deletable`.
+      await ch.bulkDelete(deletable, false)
+      const deletedIds = deletable
       const lines = [`bulk_delete in ${channelLabel(ch)}: deleted ${deletedIds.length} of ${ids.length} message(s)`]
       for (const id of deletedIds) {
         const m = known.get(id)
         lines.push(m ? `  ${id} by ${JSON.stringify(m.author.username)} (${m.author.id}): ${oneLine(m.content ?? '', 60)}` : `  ${id}`)
       }
       if (tooOld.length > 0) lines.push(`skipped ${tooOld.length} older than 14 days: ${tooOld.join(', ')}`)
-      const missed = deletable.filter(id => !deleted.has(id))
-      if (missed.length > 0) lines.push(`not deleted (filtered as too old at send time): ${missed.join(', ')}`)
+      const unseen = deletedIds.filter(id => !known.has(id)).length
+      if (target.kind === 'ids' && unseen > 0 && deletedIds.length > 1) {
+        lines.push(`(${unseen} id(s) were not in the message cache; Discord's bulk endpoint ignores ids that are not messages in this channel, so those are sent rather than confirmed)`)
+      }
       return lines.join('\n')
     }
 
@@ -633,8 +639,12 @@ async function dispatch(tool: AdminToolName, args: Record<string, unknown>, deps
       const ch = await deps.fetchChannel(channelId)
       if (!ch) throw new Error(`channel ${channelId} not found`)
       if (ch.isDMBased()) throw new Error('delete_channel deletes server channels, not DMs')
-      // Guild scope for a channel tool: resolved through the channel's own guild, and the SAME gate
-      // the other guild tools use — a channel grant alone does not license deleting the channel.
+      // Guild scope for a channel tool, resolved through the channel's own guild — and checked FIRST,
+      // from the id alone: the refusal names only the channel id the caller supplied, never the
+      // server it belongs to. A channel grant alone does not license deleting the channel.
+      if (!guildGranted(deps.loadAccess(), ch.guildId)) {
+        throw new Error(`delete_channel is guild-scoped and channel ${channelId} is in a server with no server grant — a channel grant is not enough to delete it`)
+      }
       const { guild } = await grantedGuild(deps, ch.guildId, tool)
       await requireChannelPerms(ch, tool, { isThread: ch.isThread() })
       const children = ch.type === ChannelType.GuildCategory

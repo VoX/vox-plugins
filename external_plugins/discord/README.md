@@ -102,7 +102,7 @@ Quick reference: IDs are Discord **snowflakes** (numeric — enable Developer Mo
 | `download_attachment` | Download all attachments from a specific message by ID to `~/.claude/channels/discord/inbox/`. Optional `dest_dir` copies files to a target directory. Returns file paths + metadata. Use when `fetch_messages` shows a message has attachments. |
 | `lookup` | Resolve a channel or user **name** to its snowflake ID. Takes `query` (leading `#`/`@` stripped, case-insensitive substring), optional `kind` (`channel`/`user`/`both`), `guild_id` to narrow, `limit` (default 10, max 50). Exact name matches sort first. Needs **no permissions beyond the bridge's own** — channels come from the `Guilds` intent cache (which only ever contained channels the bot can see), and users are matched against the message cache first, falling back to Discord's member-search endpoint only when that misses. Finding a channel is **not** permission to post in it; the access allowlist still decides that. |
 | `get_server_spec` | Read a guild's structure as a spec object: `everyone_permissions`, roles (name/color/hoist/mentionable/permissions/position — read-only), categories with their channels (name/kind/topic/slowmode/nsfw/overwrites), plus a `bot` section (its highest role, that role's raw position, the roles out of its reach, and which admin permissions it holds). Every entry carries its snowflake `id` for `apply_server_spec`'s rename/move matching. Read-only; output is exactly what `apply_server_spec` consumes. |
-| `apply_server_spec` | Apply a server spec to a guild — additive upsert (create/update only, **never deletes** by default). Entries that keep their `id` are renamed/moved in place instead of recreated. `prune: true` turns the apply into a full reconcile that deletes unclaimed entities (never `@everyone`, managed roles, or the bot's own role). **Applies immediately** — no owner approval since 0.8.6 — and returns the per-entry results plus the rendered diff. `dry_run: true` returns the diff without changing anything. Role order is set relationally with `above`/`below`. See [Server admin tools](#server-admin-tools). |
+| `apply_server_spec` | Apply a server spec to a guild — additive upsert (create/update only, **never deletes** by default). Entries that keep their `id` are renamed/moved in place instead of recreated. `prune: true` turns the apply into a full reconcile that deletes unclaimed entities (never `@everyone`, managed roles, or the bot's own role). **Applies immediately** — no owner approval since 0.8.6 — and returns the per-entry results plus the rendered diff. A diff that deletes anything needs `confirm_deletions` equal to its deletion count, or it is refused with the diff. `dry_run: true` returns the diff without changing anything. Role order is set relationally with `above`/`below`. See [Server admin tools](#server-admin-tools). |
 | `fetch_reactions` | Each reaction on a message: emoji, count, whether the bot reacted, and optionally up to `users_limit` (≤100) users per emoji with ids. Read-only. Channel-scoped. |
 | `get_member` / `list_members` | A member's (or up to `limit` ≤1000 members') username, display name, nickname, roles with ids, join date and timeout state. `list_members` with `query` is a name-prefix search; without one it needs the app's Server Members privileged intent. Read-only. Guild-scoped. |
 | `create_channel` | Create a `text` / `voice` / `category` channel, optionally under `parent_id` with a `topic`. Guild-scoped. |
@@ -111,7 +111,7 @@ Quick reference: IDs are Discord **snowflakes** (numeric — enable Developer Mo
 | `create_thread` | Start a public thread in a text/announcement channel, from `message_id` or standalone. The thread inherits the channel's grant. Channel-scoped. |
 | `delete_message` / `bulk_delete` | Delete one message (own: no permission needed; others': Manage Messages), or the latest `count` / listed `message_ids` (≤100; older than 14 days are skipped and listed). Returns every deleted id. Channel-scoped. |
 | `add_role` / `remove_role` | Give or take a role. The role must sit below the bot's highest role and not be managed; one carrying dangerous permissions is flagged ⚠ in the result (informational). Guild-scoped. |
-| `timeout_member` / `kick_member` / `ban_member` / `unban_member` | Moderate a member: timeout for `minutes` (≤40320; `0` lifts), kick, ban (by id, non-members too, optional `delete_message_seconds` ≤604800), unban. Owner, self and members at or above the bot's role are refused. Guild-scoped. |
+| `timeout_member` / `kick_member` / `ban_member` / `unban_member` | Moderate a member: timeout for `minutes` (≤40319, a minute under 28 days; `0` lifts), kick, ban (by id, non-members too, optional `delete_message_seconds` ≤604800), unban. Owner, self and members at or above the bot's role are refused. Guild-scoped. |
 | `set_nickname` | Set a member's nickname (`""` clears). Own: Change Nickname; others': Manage Nicknames + hierarchy. Guild-scoped. |
 
 The `typing` tool lets the assistant show a typing indicator manually —
@@ -228,8 +228,17 @@ nothing waits on it.
 
 > **Footgun:** a partial hand-authored spec + `prune` = mass-delete of
 > everything the spec omits, and since 0.8.6 nobody is asked first. Always
-> start from a fresh `get_server_spec` export when pruning, and run it with
-> `dry_run: true` before the real call.
+> start from a fresh `get_server_spec` export when pruning.
+
+**Deletion self-check.** A real apply whose diff deletes anything must pass
+`confirm_deletions` equal to the exact number of deletions the diff computes.
+Without it, or with any other number, the apply is refused, nothing is
+written, and the rendered diff comes back — so the count can only come from
+having read a dry run (which states it: `to apply, re-call with
+confirm_deletions: N`). A count that no longer matches means the spec or the
+guild changed since that dry run, and is refused even when the diff now
+deletes nothing. This is the model checking itself, not an approval: nobody
+else is asked.
 
 **No approval step (0.8.6).** Until 0.8.5 every mutating apply DMed the
 rendered diff to `DISCORD_OWNER_ID` with Allow / Deny buttons and blocked on
@@ -293,7 +302,7 @@ without it.
 
 ### 0.8.6
 - **Admin tools:** `fetch_reactions`, `get_member`, `list_members`, `create_channel`, `edit_channel`, `delete_channel`, `create_thread`, `delete_message`, `bulk_delete`, `add_role`, `remove_role`, `timeout_member`, `kick_member`, `ban_member`, `unban_member`, `set_nickname`. Channel-scoped tools use the same allowlist as `reply`; guild-scoped ones need a server grant. Every call checks the bot's permissions and role hierarchy first and returns a readable refusal. See [Admin tools](#admin-tools).
-- **The owner-approval step is gone, at the owner's request.** `apply_server_spec` no longer DMs an Allow/Deny diff or blocks; it applies at once and returns the per-entry results with the rendered diff (⚠ flags and the LARGE PRUNE banner kept, informational). `dry_run` is unchanged. The new admin tools have no approval step either. The `applyspec:` buttons, their handler and the progress keepalive are removed; `DISCORD_OWNER_ID` is still used by `/access`, `/login` and the auth DM. The tool-permission relay (`perm:` buttons, `DISCORD_AUTO_ALLOW_PERMISSIONS`) is a different mechanism and is unchanged.
+- **The owner-approval step is gone, at the owner's request.** `apply_server_spec` no longer DMs an Allow/Deny diff or blocks; it applies at once and returns the per-entry results with the rendered diff (⚠ flags and the LARGE PRUNE banner kept, informational). In its place on the destructive path: a diff that deletes anything needs `confirm_deletions` equal to its deletion count, else it is refused with the diff. `dry_run` is unchanged and now states that count. `get_server_spec` / `apply_server_spec` stay ungated by server grants — any guild the bot is in, as decided 2026-07-13. The new admin tools have no approval step either. The `applyspec:` buttons, their handler and the progress keepalive are removed; `DISCORD_OWNER_ID` is still used by `/access`, `/login` and the auth DM. The tool-permission relay (`perm:` buttons, `DISCORD_AUTO_ALLOW_PERMISSIONS`) is a different mechanism and is unchanged.
 - The pure decisions (scope per tool, required permissions, hierarchy, argument limits, result rows) live in `lib.ts`; the discord.js side is `admin.ts`, injected like `apply.ts` so it runs under test against stub guilds.
 
 ### 0.8.5

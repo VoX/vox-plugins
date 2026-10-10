@@ -1,7 +1,7 @@
 import { test, expect, describe } from 'bun:test'
 import { DiscordAPIError, type Guild } from 'discord.js'
-import { applySpecDiff, writeRolePositionsLive } from './apply'
-import { computeSpecDiff, buildServerSpec, type ServerSpec, type RawGuildState } from './lib'
+import { applySpecDiff, applyServerSpecChecked, writeRolePositionsLive } from './apply'
+import { computeSpecDiff, buildServerSpec, renderSpecDiff, type ServerSpec, type RawGuildState, type SpecDiff } from './lib'
 
 // ── The seam finding J is about ────────────────────────────────────────────────
 // server.ts had zero exports and a top-level `await mcp.connect(...)`, so importing
@@ -227,5 +227,47 @@ describe('writeRolePositionsLive', () => {
       client: { rest: { patch: async () => [{ id: 'a', position: 2, name: 'ignored', color: 0 }] } },
     } as unknown as Guild
     expect(await writeRolePositionsLive(guild, [{ id: 'a', position: 3 }])).toEqual([{ id: 'a', position: 2 }])
+  })
+})
+
+// ── 0.8.6: apply_server_spec's real path, which server.ts calls as-is ──────────────────────────────
+describe('applyServerSpecChecked — a deleting apply needs confirm_deletions, and nothing is written without it', () => {
+  function deletableGuild() {
+    const calls: string[] = []
+    const roles = new Map([['200', {
+      id: '200', name: 'Old', rawPosition: 1, position: 1, managed: false,
+      delete: async () => { calls.push('delete role 200') },
+    }]])
+    const guild = { id: '1', name: 'Stub', roles: { cache: roles }, channels: { cache: new Map() }, members: { me: null } } as unknown as Guild
+    return { guild, calls }
+  }
+  const diff: SpecDiff = { entries: [{ kind: 'role', op: 'delete', name: 'Old', id: '200', changes: [], dangerous: [] }], untouched: [] }
+  const rendered = renderSpecDiff(diff)
+  const noWrites = { writeRolePositions: async () => { throw new Error('no reorder expected') } }
+
+  test('no confirm_deletions: refused, the rendered diff is returned, nothing deleted', async () => {
+    const { guild, calls } = deletableGuild()
+    const out = await applyServerSpecChecked(guild, {}, diff, rendered, undefined, noWrites)
+    expect(out.isError).toBe(true)
+    expect(out.text).toContain('confirm_deletions: 1')
+    expect(out.text).toContain('- DELETE')
+    expect(calls).toEqual([])
+  })
+
+  test('a mismatched count: refused, nothing deleted', async () => {
+    const { guild, calls } = deletableGuild()
+    const out = await applyServerSpecChecked(guild, {}, diff, rendered, 2, noWrites)
+    expect(out.isError).toBe(true)
+    expect(out.text).toContain('confirm_deletions is 2 but this diff deletes 1')
+    expect(calls).toEqual([])
+  })
+
+  test('the exact count: applied, with the per-entry result and the diff it applied', async () => {
+    const { guild, calls } = deletableGuild()
+    const out = await applyServerSpecChecked(guild, {}, diff, rendered, 1, noWrites)
+    expect(out.isError).toBe(false)
+    expect(calls).toEqual(['delete role 200'])
+    expect(out.text).toContain('applied to Stub: 1/1 change(s) succeeded')
+    expect(out.text).toContain('── diff applied ──')
   })
 })

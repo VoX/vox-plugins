@@ -141,7 +141,12 @@ function stubChannel(g: ReturnType<typeof stubGuild>, botChannelPerms: string[],
         return new Map([...byId].slice(0, arg.limit))
       },
     },
-    bulkDelete: async (ids: string[]) => { g.calls.push(`bulkDelete ${ids.join(',')}`); return new Map(ids.map(id => [id, {}])) },
+    // As discord.js does it: ONE id is deleted singly, and the returned collection is EMPTY when that
+    // message was not cached (TextBasedChannel.bulkDelete -> MessageDelete.getMessage).
+    bulkDelete: async (ids: string[]) => {
+      g.calls.push(`bulkDelete ${ids.join(',')}`)
+      return ids.length === 1 ? new Map() : new Map(ids.map(id => [id, {}]))
+    },
     threads: { create: async (o: { name: string }) => { g.calls.push(`threads.create ${o.name}`); return { id: '366666666666666666', name: o.name } } },
     delete: async () => { g.calls.push(`delete channel ${CHAN}`) },
   }
@@ -231,8 +236,17 @@ describe('guild scope — the server grant gate', () => {
   test('delete_channel needs the SERVER grant — a grant on the channel itself is not enough', async () => {
     const g = stubGuild(ALL_PERMS)
     const ch = stubChannel(g, ALL_PERMS)
-    await expect(runAdminTool('delete_channel', { channel_id: CHAN }, deps(g.guild, CHANNEL_ONLY, fetchable(ch))))
-      .rejects.toThrow(/no server grant/)
+    let refusal = ''
+    const looked: string[] = []
+    const d = deps(g.guild, CHANNEL_ONLY, fetchable(ch))
+    const spied = { ...d, getGuild: (id: string) => { looked.push(id); return d.getGuild(id) } }
+    await runAdminTool('delete_channel', { channel_id: CHAN }, spied).catch(e => { refusal = String(e) })
+    expect(looked).toEqual([])                     // the guild was never looked up
+    expect(refusal).toContain('no server grant')
+    expect(refusal).toContain(CHAN)
+    // checked from the id alone: the refusal names neither the server nor its id
+    expect(refusal).not.toContain('Wheat')
+    expect(refusal).not.toContain(GUILD)
     expect(g.calls).toEqual([])
     const out = await runAdminTool('delete_channel', { channel_id: CHAN }, deps(g.guild, GRANTED, fetchable(ch)))
     expect(g.calls).toEqual([`delete channel ${CHAN}`])
@@ -358,6 +372,18 @@ describe('bulk_delete', () => {
     expect(out).toContain('deleted 2 of 3')
     expect(out).toContain(`${fresh1} by "alice" (${ALICE})`)
     expect(out).toContain(`${fresh2} by "mod" (${MOD})`)
+    expect(out).toContain(`skipped 1 older than 14 days: ${old}`)
+  })
+
+  test('exactly one uncached message left: discord.js returns nothing, and it is still reported as deleted', async () => {
+    const g = stubGuild(ALL_PERMS)
+    const only = msgIdAt(NOW - 60_000, 7)
+    const old = msgIdAt(NOW - BULK_DELETE_MAX_AGE_MS - 60_000, 8)
+    const ch = stubChannel(g, ALL_PERMS)           // empty cache: neither id is known
+    const out = await runAdminTool('bulk_delete', { chat_id: CHAN, message_ids: [only, old] }, deps(g.guild, GRANTED, allowed(ch)))
+    expect(g.calls).toEqual([`bulkDelete ${only}`])
+    expect(out).toContain('deleted 1 of 2')
+    expect(out).toContain(`  ${only}`)
     expect(out).toContain(`skipped 1 older than 14 days: ${old}`)
   })
 

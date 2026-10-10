@@ -21,6 +21,7 @@ import {
   type PermissionResolvable,
 } from 'discord.js'
 import {
+  deletionConfirmRefusal,
   specEntryLabel,
   namedOrderingConstraints,
   resolveOrderingConstraints,
@@ -162,6 +163,20 @@ async function applyOverwriteEdits(channel: NonThreadGuildBasedChannel, edits: O
 // creates/updates (so role:<Name> overwrites and parent categories created
 // earlier in the run resolve), then renames/moves, then deletes (child
 // channels → their now-empty categories → roles).
+/**
+ * apply_server_spec's real (non-dry-run) path, as server.ts runs it: the deletion self-check, then the
+ * apply. Here rather than inline so the check is exercised by the same code that dispatches the write.
+ * `rendered` is renderSpecDiff(diff); a refusal returns it so the caller sees what it must confirm.
+ */
+export async function applyServerSpecChecked(
+  guild: Guild, desired: ServerSpec, diff: SpecDiff, rendered: string, confirmDeletions: unknown, deps: ApplyDeps = LIVE_DEPS,
+): Promise<{ text: string; isError: boolean }> {
+  const refusal = deletionConfirmRefusal(diff, confirmDeletions)
+  if (refusal) return { text: `${refusal}\n\n${rendered}`, isError: true }
+  const result = await applySpecDiff(guild, desired, diff, deps)
+  return { text: `${result}\n\n── diff applied ──\n${rendered}`, isError: false }
+}
+
 export async function applySpecDiff(guild: Guild, desired: ServerSpec, diff: SpecDiff, deps: ApplyDeps = LIVE_DEPS): Promise<string> {
   const roleByName = new Map<string, string>()
   for (const r of guild.roles.cache.values()) {
