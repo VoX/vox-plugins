@@ -15,6 +15,7 @@ All state lives in `~/.claude/channels/discord/access.json`. The `/discord:acces
 | Default policy | `pairing` |
 | Sender ID | User snowflake (numeric, e.g. `184695080709324800`) |
 | Group key | Channel snowflake — not guild ID |
+| Guild key | Server snowflake — a whole-server grant (0.8.5+) |
 | Config file | `~/.claude/channels/discord/access.json` |
 
 ## DM policies
@@ -58,6 +59,20 @@ With the default `requireMention: true`, the bot responds only when @mentioned o
 /discord:access group rm 846209781206941736
 ```
 
+## Whole servers
+
+To cover every channel in a server — including channels and threads created later — grant the **guild** instead, keyed on the server snowflake (Developer Mode, right-click the server icon, Copy Server ID). It takes the same flags as a channel grant.
+
+```
+/discord:access guild add 1155098001112342528
+/discord:access guild add 1155098001112342528 --no-mention --allow 184695080709324800
+/discord:access guild rm 1155098001112342528
+```
+
+Lookup order for a message in a guild channel: the channel's own `groups` entry (a thread uses its parent channel's), then its server's `guilds` entry, then drop. **A channel entry wins outright** — fields are not merged — so you can make one channel stricter or looser than the server default by giving it its own entry. Removing a channel's entry does *not* exclude it from a granted server; to quiet one channel inside a granted server, give it a stricter entry (e.g. `--allow` a single ID) or `/dunk` it.
+
+The outbound tools (`reply`, `react`, `edit_message`, `fetch_messages`, …) follow the same lookup, so any channel the bot can hear in a granted server is one it can answer in. A server entry's `allowFrom` and `requireMention` are inbound rules only.
+
 ## The /access slash command
 
 `/access` manages guild-channel access from inside Discord — no terminal
@@ -73,9 +88,13 @@ guild he does not administer.
 
 | Usage | Effect |
 | --- | --- |
-| `/access action:list` | Show `dmPolicy` and every granted channel with its `requireMention` / `allowFrom`. |
+| `/access action:list` | Show `dmPolicy`, every granted server and every granted channel, each with its `requireMention` / `allowFrom`. |
 | `/access action:grant` | Grant the current channel (or `channel:` option). `mentions_only` sets `requireMention` (default `true`). Re-granting updates `requireMention` but **preserves** any existing `allowFrom` restriction. |
-| `/access action:remove` | Remove the channel's grant. |
+| `/access action:remove` | Remove the channel's grant. If the server is also granted, the reply warns that the channel is still covered. |
+| `/access action:grant scope:server` | Grant the **whole server the command is run in** — every channel and thread, present and future. Same `mentions_only` option and the same merge behaviour. Refused in DMs and when combined with `channel:` or `user:`. |
+| `/access action:remove scope:server` | Remove the server-wide grant. Channels with their own entries keep working, and the reply says how many. |
+
+`scope` defaults to `channel`, so every invocation from before 0.8.5 means what it did. The server is always the one the command is typed in — it is not an option — so a grant can only ever target the server you are looking at. There is no slash-command option for a server entry's `allowFrom`, exactly as there is none for a channel's; set it with `/discord:access guild add … --allow`.
 
 Replies are ephemeral. Writes go through the same lock + atomic-save path as
 the `/discord:access` skill. In static mode (`DISCORD_ACCESS_MODE=static`)
@@ -123,6 +142,8 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
 | `/discord:access policy allowlist` | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`. |
 | `/discord:access group add 846209781206941736` | Enable a guild channel. Flags: `--no-mention`, `--allow id1,id2`. |
 | `/discord:access group rm 846209781206941736` | Disable a guild channel. |
+| `/discord:access guild add 1155098001112342528` | Enable every channel in a server. Flags: `--no-mention`, `--allow id1,id2`. |
+| `/discord:access guild rm 1155098001112342528` | Remove a server-wide grant. |
 | `/discord:access set ackReaction 🔨` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `mentionPatterns`. |
 
 ## Config file
@@ -145,6 +166,13 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
       // Restrict triggers to these senders. Empty = any member (subject to requireMention).
       "allowFrom": []
     }
+  },
+
+  // Whole servers, keyed on GUILD id (optional; absent = {}). Covers every
+  // channel and thread in the server unless it has its own "groups" entry,
+  // which wins. Same fields as a "groups" entry.
+  "guilds": {
+    "1155098001112342528": { "requireMention": true, "allowFrom": [] }
   },
 
   // Case-insensitive regexes that count as a mention.

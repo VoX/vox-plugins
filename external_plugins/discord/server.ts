@@ -47,7 +47,7 @@ import { join, sep, dirname } from 'path'
 import sharp from 'sharp'
 import { snapshotGuild, applySpecDiff } from './apply'
 import { orderingCrossings, planRolePositions } from './lib'
-import { normalizeLookupQuery, clampLookupLimit, lookupNameMatches, lookupRank, safeSlice, formatSendResult, chunk, buildEmbedFromArgs, EMBED_SCHEMA_PROPS, PRESENCE_IDLE, isIdle, composePresence, withContextPrefix, buildServerSpec, computeSpecDiff, renderSpecDiff, grantGroup, removeGroup, grantDm, removeDm, resolveById, makeTtlCache, DANGEROUS_PERMS, PRUNE_GUARD_MAX_DELETIONS, PRUNE_GUARD_CHANNEL_FRACTION, type ServerSpec, type SpecDiff } from './lib'
+import { normalizeLookupQuery, clampLookupLimit, lookupNameMatches, lookupRank, safeSlice, formatSendResult, chunk, buildEmbedFromArgs, EMBED_SCHEMA_PROPS, PRESENCE_IDLE, isIdle, composePresence, withContextPrefix, buildServerSpec, computeSpecDiff, renderSpecDiff, grantGroup, removeGroup, resolveChannelPolicy, channelAllowed, groupGateVerdict, parseAccess, defaultAccess, type Access, grantDm, removeDm, resolveById, makeTtlCache, DANGEROUS_PERMS, PRUNE_GUARD_MAX_DELETIONS, PRUNE_GUARD_CHANNEL_FRACTION, type ServerSpec, type SpecDiff } from './lib'
 
 // Opt-in gate. Plugin is inert unless VOX_PLUGINS_ENABLED=1 is set in the
 // environment (only our systemd service sets it). Fresh claude CLI sessions
@@ -449,43 +449,7 @@ const client = new Client({
   allowedMentions: { parse: ["users"], repliedUser: true },
 })
 
-type PendingEntry = {
-  senderId: string
-  chatId: string // DM channel ID — where to send the approval confirm
-  createdAt: number
-  expiresAt: number
-  replies: number
-}
-
-type GroupPolicy = {
-  requireMention: boolean
-  allowFrom: string[]
-}
-
-type Access = {
-  dmPolicy: 'pairing' | 'allowlist' | 'disabled'
-  allowFrom: string[]
-  /** Keyed on channel ID (snowflake), not guild ID. One entry per guild channel. */
-  groups: Record<string, GroupPolicy>
-  pending: Record<string, PendingEntry>
-  mentionPatterns?: string[]
-  // delivery/UX config — optional, defaults live in the reply handler
-  /** Emoji to react with on receipt. Empty string disables. Unicode char or custom emoji ID. */
-  ackReaction?: string
-  /** Which chunks get Discord's reply reference when reply_to is passed. Default: 'first'. 'off' = never thread. */
-  replyToMode?: 'off' | 'first' | 'all'
-  /** Max chars per outbound message before splitting. Default: 2000 (Discord's hard cap). */
-  textChunkLimit?: number
-}
-
-function defaultAccess(): Access {
-  return {
-    dmPolicy: 'pairing',
-    allowFrom: [],
-    groups: {},
-    pending: {},
-  }
-}
+// The access.json schema (Access, its defaults and its parse) lives in lib.ts so it is testable.
 
 const MAX_CHUNK_LIMIT = 2000
 // Inbound and outbound caps are NOT the same thing and used to share one constant, which read like
@@ -536,9 +500,7 @@ function assertSendable(f: string): void {
 
 function readAccessFile(): Access {
   try {
-    const raw = readFileSync(ACCESS_FILE, 'utf8')
-    const parsed = JSON.parse(raw) as Partial<Access>
-    return { ...defaultAccess(), ...parsed }
+    return parseAccess(readFileSync(ACCESS_FILE, 'utf8'))
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
     try { renameSync(ACCESS_FILE, `${ACCESS_FILE}.corrupt-${Date.now()}`) } catch {}
@@ -691,21 +653,19 @@ async function gate(msg: Message): Promise<GateResult> {
 
   if (access.dmPolicy === 'disabled') return { action: 'drop' }
 
-  // We key on channel ID (not guild ID) — simpler, and lets the user
-  // opt in per-channel rather than per-server. Threads inherit their
-  // parent channel's opt-in; the reply still goes to msg.channelId
-  // (the thread), this is only the gate lookup.
-  const channelId = msg.channel.isThread()
-    ? msg.channel.parentId ?? msg.channelId
-    : msg.channelId
-  const policy = access.groups[channelId]
-  if (!policy) return { action: 'drop' }
-  const groupAllowFrom = policy.allowFrom ?? []
-  const requireMention = policy.requireMention ?? true
-  if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
-    return { action: 'drop' }
-  }
-  if (requireMention && !(await isMentioned(msg, access.mentionPatterns))) {
+  // A channel's own `groups` entry (threads look up their parent's) wins; with none, a server-wide
+  // `guilds` entry for msg.guildId covers it — including channels and threads created after the
+  // grant. The reply still goes to msg.channelId (the thread); this is only the gate lookup.
+  // resolveChannelPolicy is shared with fetchAllowedChannel so inbound and outbound cannot disagree.
+  const resolved = resolveChannelPolicy(access, {
+    id: msg.channelId,
+    isThread: msg.channel.isThread(),
+    parentId: msg.channel.isThread() ? msg.channel.parentId : null,
+    guildId: msg.guildId,
+  })
+  const verdict = groupGateVerdict(resolved?.policy, senderId)
+  if (verdict === 'drop') return { action: 'drop' }
+  if (verdict === 'needs-mention' && !(await isMentioned(msg, access.mentionPatterns))) {
     return { action: 'drop' }
   }
   return { action: 'deliver', access }
@@ -799,7 +759,9 @@ async function fetchTextChannel(id: string) {
 
 // Outbound gate — tools can only target chats the inbound gate would deliver
 // from. DM channel ID ≠ user ID, so we inspect the fetched channel's type.
-// Thread → parent lookup mirrors the inbound gate.
+// Guild channels go through the SAME resolveChannelPolicy as the inbound gate
+// (thread → parent, then a server-wide `guilds` grant), so a channel covered
+// only by a guild grant is sendable too.
 async function fetchAllowedChannel(id: string) {
   const ch = await fetchTextChannel(id)
   const access = loadAccess()
@@ -807,8 +769,13 @@ async function fetchAllowedChannel(id: string) {
     const userId = ch.recipientId ?? dmChannelUsers.get(id)
     if (userId && access.allowFrom.includes(userId)) return ch
   } else {
-    const key = ch.isThread() ? ch.parentId ?? ch.id : ch.id
-    if (key in access.groups) return ch
+    const ref = {
+      id: ch.id,
+      isThread: ch.isThread(),
+      parentId: ch.isThread() ? ch.parentId : null,
+      guildId: 'guildId' in ch ? ch.guildId : null,
+    }
+    if (channelAllowed(access, ref)) return ch
   }
   throw new Error(`channel ${id} is not allowlisted — add via /discord:access`)
 }
@@ -3331,16 +3298,28 @@ client.on('interactionCreate', async (interaction: Interaction) => {
       }
       const action = interaction.options.getString('action') ?? ''
       const channelId = interaction.options.getChannel('channel')?.id ?? interaction.channelId
+      // scope:server targets access.guilds[<this guild>] instead of access.groups[<channel>].
+      // Default 'channel' keeps every pre-0.8.5 invocation meaning exactly what it did.
+      const scope = interaction.options.getString('scope') ?? 'channel'
+      const policyFlags = (g: Access['groups'][string]) =>
+        `requireMention: ${g.requireMention ?? true}${(g.allowFrom ?? []).length > 0 ? `, allowFrom: ${g.allowFrom.join(', ')}` : ''}`
 
       if (action === 'list') {
         const access = loadAccess()
         const groups = Object.entries(access.groups)
+        const guilds = Object.entries(access.guilds ?? {})
         const lines = [
           `dmPolicy: ${access.dmPolicy}${STATIC ? ' (static mode — read-only)' : ''}`,
+          // Server-wide grants first: they cover every channel below them that has no entry of its own.
+          guilds.length === 0
+            ? 'servers: (none)'
+            : `servers (every channel without its own entry):\n${guilds.map(([gid, g]) =>
+                `• ${client.guilds.cache.get(gid)?.name ?? '(bot not in this server)'} (${gid}) — ${policyFlags(g)}`,
+              ).join('\n')}`,
           groups.length === 0
             ? 'channels: (none)'
             : `channels:\n${groups.map(([cid, g]) =>
-                `• <#${cid}> (${cid}) — requireMention: ${g.requireMention ?? true}${(g.allowFrom ?? []).length > 0 ? `, allowFrom: ${g.allowFrom.join(', ')}` : ''}`,
+                `• <#${cid}> (${cid}) — ${policyFlags(g)}`,
               ).join('\n')}`,
           // The TOP-LEVEL allowFrom (who may DM the bot) -- distinct from each channel's own
           // allowFrom printed above, which is a per-channel sender filter. Same field name, different
@@ -3376,6 +3355,15 @@ client.on('interactionCreate', async (interaction: Interaction) => {
       // NOTE this only authorises INBOUND DMs. The bot still cannot open a DM with someone who has never
       // messaged it: there is no createDM anywhere in this plugin, so a DM channel has to exist first.
       const targetUser = interaction.options.getUser('user')
+      // `user` means DM access and `scope:server` means a guild grant; together they are ambiguous, and
+      // guessing wrong on an access mutation is worse than asking again.
+      if (targetUser && scope === 'server') {
+        await interaction.reply({
+          content: '`user` (DM access) and `scope:server` (whole-server grant) are separate operations — run them separately.',
+          flags: MessageFlags.Ephemeral,
+        }).catch(() => {})
+        return
+      }
       if (targetUser) {
         if (action === 'grant') {
           const added = await withAccessLock(() => {
@@ -3405,26 +3393,100 @@ client.on('interactionCreate', async (interaction: Interaction) => {
         return
       }
 
+      if (scope !== 'channel' && scope !== 'server') {
+        await interaction.reply({ content: `unknown scope "${scope}" — use channel or server`, flags: MessageFlags.Ephemeral }).catch(() => {})
+        return
+      }
+
+      // SERVER-WIDE grant: access.guilds[<this guild>], the same policy shape as a channel entry, so
+      // grantGroup/removeGroup apply unchanged with the guild id as the key. The guild is always the one
+      // the command was run in — never an option — so the owner cannot grant a server he is not looking at.
+      if (scope === 'server') {
+        const guildId = interaction.guildId
+        if (!guildId) {
+          await interaction.reply({
+            content: '`scope:server` only works inside a server — run it from any channel in the server you mean.',
+            flags: MessageFlags.Ephemeral,
+          }).catch(() => {})
+          return
+        }
+        // The channel picker only offers this server's channels, so `channel` adds nothing here — and a
+        // caller who passed one probably expected a channel-scoped change. Refuse rather than guess.
+        if (interaction.options.getChannel('channel')) {
+          await interaction.reply({
+            content: '`scope:server` applies to the whole server this command is run in — drop the `channel` option.',
+            flags: MessageFlags.Ephemeral,
+          }).catch(() => {})
+          return
+        }
+        const guildName = interaction.guild?.name ?? guildId
+        if (action === 'grant') {
+          const requireMention = interaction.options.getBoolean('mentions_only') ?? true
+          await withAccessLock(() => {
+            const access = loadAccess()
+            access.guilds ??= {}
+            grantGroup(access.guilds, guildId, requireMention)
+            saveAccess(access)
+          })
+          await interaction.reply({
+            content: `✅ granted the whole server **${guildName}** (${guildId}) — requireMention: ${requireMention}\n` +
+              `covers every channel and thread here, including new ones. a channel with its own entry keeps its own settings.`,
+            flags: MessageFlags.Ephemeral,
+          }).catch(() => {})
+        } else if (action === 'remove') {
+          const result = await withAccessLock(() => {
+            const access = loadAccess()
+            const had = access.guilds ? removeGroup(access.guilds, guildId) : false
+            if (had) saveAccess(access)
+            // Channel entries in this guild survive a server-wide removal; say so, or "removed" reads as
+            // "the bot is out of this server" when it is not.
+            const stillListed = Object.keys(access.groups).filter(cid => {
+              const c = client.channels.cache.get(cid)
+              return c != null && 'guildId' in c && c.guildId === guildId
+            }).length
+            return { had, stillListed }
+          })
+          await interaction.reply({
+            content: (result.had
+              ? `🚫 removed the server-wide grant for **${guildName}**`
+              : `**${guildName}** had no server-wide grant — nothing to remove`) +
+              (result.stillListed > 0 ? `\n${result.stillListed} channel(s) here still have their own entries and keep working.` : ''),
+            flags: MessageFlags.Ephemeral,
+          }).catch(() => {})
+        } else {
+          await interaction.reply({ content: `unknown action "${action}" — use grant, remove, or list`, flags: MessageFlags.Ephemeral }).catch(() => {})
+        }
+        return
+      }
+
       if (action === 'grant') {
         const requireMention = interaction.options.getBoolean('mentions_only') ?? true
-        await withAccessLock(() => {
+        const overridesGuild = await withAccessLock(() => {
           const access = loadAccess()
           grantGroup(access.groups, channelId, requireMention)
           saveAccess(access)
+          return interaction.guildId != null && access.guilds?.[interaction.guildId] != null
         })
         await interaction.reply({
-          content: `✅ granted <#${channelId}> — requireMention: ${requireMention}`,
+          content: `✅ granted <#${channelId}> — requireMention: ${requireMention}` +
+            (overridesGuild ? `\nthis channel's entry now overrides the server-wide grant here.` : ''),
           flags: MessageFlags.Ephemeral,
         }).catch(() => {})
       } else if (action === 'remove') {
-        const removed = await withAccessLock(() => {
+        const result = await withAccessLock(() => {
           const access = loadAccess()
           const had = removeGroup(access.groups, channelId)
           if (had) saveAccess(access)
-          return had
+          // A server-wide grant still covers this channel after its own entry is gone. Without this the
+          // reply says "removed" while the bot keeps listening here.
+          const guildPolicy = interaction.guildId ? access.guilds?.[interaction.guildId] : undefined
+          return { had, guildPolicy }
         })
         await interaction.reply({
-          content: removed ? `🚫 removed <#${channelId}> from granted channels` : `<#${channelId}> wasn't granted — nothing to remove`,
+          content: (result.had ? `🚫 removed <#${channelId}> from granted channels` : `<#${channelId}> wasn't granted — nothing to remove`) +
+            (result.guildPolicy
+              ? `\n⚠️ still covered by the server-wide grant (requireMention: ${result.guildPolicy.requireMention ?? true}) — remove that with \`scope:server\`, or /dunk this channel.`
+              : ''),
           flags: MessageFlags.Ephemeral,
         }).catch(() => {})
       } else {
@@ -3767,6 +3829,12 @@ const SLASH_COMMANDS = [
       { type: 7, name: 'channel', description: 'Target channel (defaults to the current channel)', required: false },
       { type: 5, name: 'mentions_only', description: 'Only respond when @mentioned (default true)', required: false },
       { type: 6, name: 'user', description: 'Target USER — grant/remove their DM access instead of a channel', required: false },
+      // Appended last, and optional with a 'channel' default, so every existing invocation keeps its meaning.
+      { type: 3, name: 'scope', description: 'channel (default) or server — server grants/removes every channel in this server', required: false,
+        choices: [
+          { name: 'channel', value: 'channel' },
+          { name: 'server', value: 'server' },
+        ] },
     ] },
   // /login — owner-only re-authentication, so a logged-out bot can be recovered without SSH.
   // This works BECAUSE being logged out does not kill the bot: claude keeps running, this MCP

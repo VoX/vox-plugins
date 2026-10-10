@@ -1172,7 +1172,8 @@ export function renderSpecDiff(diff: SpecDiff): string {
   return lines.join('\n')
 }
 
-// ── /access slash-command mutations (pure; operate on access.json groups) ──
+// ── /access slash-command mutations (pure; operate on access.json groups OR guilds — same policy
+// shape, so a server-wide grant reuses these with the guild id as the key) ──
 export type GroupPolicyLike = { requireMention: boolean; allowFrom: string[] }
 
 // Merge-grant: enable (or update) a guild channel, preserving any existing
@@ -1188,6 +1189,120 @@ export function removeGroup(groups: Record<string, GroupPolicyLike>, channelId: 
   if (!(channelId in groups)) return false
   delete groups[channelId]
   return true
+}
+
+// ── access.json schema ──
+// Lives here rather than in server.ts so the parse and the channel-resolution rules below are
+// testable without importing server.ts, which connects to Discord on import.
+
+export type PendingEntry = {
+  senderId: string
+  chatId: string // DM channel ID — where to send the approval confirm
+  createdAt: number
+  expiresAt: number
+  replies: number
+}
+
+export type GroupPolicy = GroupPolicyLike
+
+export type Access = {
+  dmPolicy: 'pairing' | 'allowlist' | 'disabled'
+  allowFrom: string[]
+  /** Keyed on channel ID (snowflake), not guild ID. One entry per guild channel. */
+  groups: Record<string, GroupPolicy>
+  /**
+   * Keyed on GUILD ID. A server-wide grant: every channel and thread in that guild, including ones
+   * created after the grant, is covered with this policy unless it has its own `groups` entry, which
+   * always wins. Optional because every access.json written before 0.8.5 lacks it.
+   */
+  guilds?: Record<string, GroupPolicy>
+  pending: Record<string, PendingEntry>
+  mentionPatterns?: string[]
+  // delivery/UX config — optional, defaults live in the reply handler
+  /** Emoji to react with on receipt. Empty string disables. Unicode char or custom emoji ID. */
+  ackReaction?: string
+  /** Which chunks get Discord's reply reference when reply_to is passed. Default: 'first'. 'off' = never thread. */
+  replyToMode?: 'off' | 'first' | 'all'
+  /** Max chars per outbound message before splitting. Default: 2000 (Discord's hard cap). */
+  textChunkLimit?: number
+}
+
+export function defaultAccess(): Access {
+  return {
+    dmPolicy: 'pairing',
+    allowFrom: [],
+    groups: {},
+    guilds: {},
+    pending: {},
+  }
+}
+
+// Throws on invalid JSON — the caller decides what a corrupt file means (server.ts moves it aside).
+// Keys absent from the file take their defaults, so a pre-0.8.5 file with no `guilds` reads as `{}`.
+export function parseAccess(raw: string): Access {
+  const parsed = JSON.parse(raw) as Partial<Access>
+  return { ...defaultAccess(), ...parsed }
+}
+
+// ── which policy governs a guild channel ──
+// ONE function for inbound (gate) and outbound (fetchAllowedChannel). They used to compute this
+// separately, and a server-wide grant added to only one side is the exact failure mode: inbound
+// delivers, and every reply throws "not allowlisted".
+
+export type ChannelRef = {
+  id: string
+  isThread: boolean
+  /** For a thread, the channel it hangs off. Threads inherit their parent's grant. */
+  parentId?: string | null
+  guildId?: string | null
+}
+
+export type ResolvedChannelPolicy = {
+  policy: GroupPolicyLike
+  /** 'channel' = a `groups` entry (keyed on the channel, or a thread's parent); 'guild' = a `guilds` entry. */
+  source: 'channel' | 'guild'
+  /** The access.json key that matched: a channel id or a guild id, per `source`. */
+  key: string
+}
+
+// Own-property lookup that tolerates a missing or null map (a hand-edited `"guilds": null`).
+function ownEntry<T>(rec: Record<string, T> | null | undefined, key: string): T | undefined {
+  if (!rec || typeof rec !== 'object' || !Object.hasOwn(rec, key)) return undefined
+  return rec[key] ?? undefined
+}
+
+// A channel's own `groups` entry wins outright over its guild's — no merging of fields — so a
+// channel can be made stricter (or looser) than the server-wide default.
+export function resolveChannelPolicy(
+  access: { groups?: Record<string, GroupPolicyLike> | null; guilds?: Record<string, GroupPolicyLike> | null },
+  ch: ChannelRef,
+): ResolvedChannelPolicy | undefined {
+  const key = ch.isThread ? ch.parentId ?? ch.id : ch.id
+  const own = ownEntry(access.groups, key)
+  if (own) return { policy: own, source: 'channel', key }
+  if (ch.guildId) {
+    const guild = ownEntry(access.guilds, ch.guildId)
+    if (guild) return { policy: guild, source: 'guild', key: ch.guildId }
+  }
+  return undefined
+}
+
+// Outbound: may tools send to / react in / edit in / fetch from this guild channel?
+// A sender filter or mention rule is an INBOUND concern; any granted channel is a valid target.
+export function channelAllowed(
+  access: Parameters<typeof resolveChannelPolicy>[0],
+  ch: ChannelRef,
+): boolean {
+  return resolveChannelPolicy(access, ch) !== undefined
+}
+
+// Inbound, after the policy is resolved. The mention check itself is async (it may fetch the
+// replied-to message), so this returns 'needs-mention' and leaves it to the caller.
+export function groupGateVerdict(policy: GroupPolicyLike | undefined, senderId: string): 'drop' | 'deliver' | 'needs-mention' {
+  if (!policy) return 'drop'
+  const allowFrom = policy.allowFrom ?? []
+  if (allowFrom.length > 0 && !allowFrom.includes(senderId)) return 'drop'
+  return (policy.requireMention ?? true) ? 'needs-mention' : 'deliver'
 }
 
 // ── DM access (the TOP-LEVEL allowFrom: who may DM the bot) ──

@@ -50,6 +50,9 @@ it consistently.
   "groups": {
     "<channelId>": { "requireMention": true, "allowFrom": [] }
   },
+  "guilds": {
+    "<guildId>": { "requireMention": true, "allowFrom": [] }
+  },
   "pending": {
     "<6-char-code>": {
       "senderId": "...", "chatId": "...",
@@ -60,7 +63,15 @@ it consistently.
 }
 ```
 
-Missing file = `{dmPolicy:"pairing", allowFrom:[], groups:{}, pending:{}}`.
+Missing file = `{dmPolicy:"pairing", allowFrom:[], groups:{}, guilds:{}, pending:{}}`.
+A file with no `guilds` key (anything written before 0.8.5) means `guilds: {}` —
+don't add the key just to read it; add it when you first write a guild entry.
+
+`groups` is keyed on **channel** ID; `guilds` is keyed on **guild (server)** ID
+and covers every channel and thread in that server, including ones created
+later. A channel's own `groups` entry always wins over its guild's entry (the
+two are not merged), so a channel can be made stricter or looser than the
+server default.
 
 ---
 
@@ -72,7 +83,7 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 
 1. Read `$STATE_DIR/access.json` (handle missing file).
 2. Show: dmPolicy, allowFrom count and list, pending count with codes +
-   sender IDs + age, groups count.
+   sender IDs + age, groups count, guilds count.
 
 ### `pair <code>`
 
@@ -118,6 +129,30 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 ### `group rm <channelId>`
 
 1. Read, `delete groups[<channelId>]`, write.
+2. If the channel's server has a `guilds` entry, warn that the channel is
+   still covered by the server-wide grant (you may not know the channel's
+   guild from its ID alone — if any `guilds` entry exists, say so and let the
+   user judge).
+
+### `guild add <guildId>` (optional: `--no-mention`, `--allow id1,id2`)
+
+Server-wide grant: every channel and thread in that server, present and
+future, unless the channel has its own `groups` entry.
+
+1. Read (create default if missing).
+2. Set `guilds[<guildId>] = { requireMention: !hasFlag("--no-mention"),
+   allowFrom: parsedAllowList }` (create `guilds` if absent).
+3. Write.
+
+The ID is the **guild/server** snowflake (Developer Mode → right-click the
+server icon → Copy Server ID), not a channel ID. A channel ID here grants
+nothing and fails silently — if the user isn't sure which they have, ask.
+
+### `guild rm <guildId>`
+
+1. Read, `delete guilds[<guildId>]`, write.
+2. Channels in that server with their own `groups` entries keep working —
+   mention it if there are any.
 
 ### `set <key> <value>`
 
@@ -139,6 +174,8 @@ Read, set the key, write, confirm.
 - Pretty-print the JSON (2-space indent) so it's hand-editable.
 - The channels dir might not exist if the server hasn't run yet — handle
   ENOENT gracefully and create defaults.
+- `group` keys are channel snowflakes; `guild` keys are server snowflakes.
+  Both are numeric and look identical — don't swap them.
 - Sender IDs are user snowflakes (Discord numeric user IDs). Chat IDs are
   DM channel snowflakes — they differ from the user's snowflake. Don't
   confuse the two.

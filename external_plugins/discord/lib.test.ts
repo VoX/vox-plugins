@@ -5,6 +5,7 @@ import {
   buildServerSpec, computeSpecDiff, renderSpecDiff, overwriteEditMap, grantGroup, removeGroup, makeTtlCache,
   normalizeLookupQuery, clampLookupLimit, lookupNameMatches, lookupRank,
   grantDm, removeDm, resolveById,
+  parseAccess, defaultAccess, resolveChannelPolicy, channelAllowed, groupGateVerdict,
   planRolePositions,
   resolveOrderingConstraints,
   namedOrderingConstraints,
@@ -1028,6 +1029,195 @@ describe('lookup query normalisation (every case here is a defect review found i
 // The owner asked for /access to authorise DM conversations as well as channels (2026-08-21). The
 // handler is owner-gated in server.ts; what is testable is the state transition, so that is what these
 // pin. Mirrors the grantGroup/removeGroup tests above.
+// ── server-wide (guild) grants ──
+// Snowflakes: guild G1 holds channels C_LISTED (own entry), C_NEW (no entry, e.g. created after the
+// grant) and thread T (parent C_NEW). G2 is a guild nobody granted, holding C_OTHER.
+const G1 = '1000000000000000001', G2 = '1000000000000000002'
+const C_LISTED = '2000000000000000001', C_NEW = '2000000000000000002', C_OTHER = '2000000000000000003'
+const T = '3000000000000000001', T_UNDER_LISTED = '3000000000000000002'
+const ALICE = '4000000000000000001', BOB = '4000000000000000002'
+
+const chan = (id: string, guildId: string | null) => ({ id, isThread: false, parentId: null, guildId })
+const thread = (id: string, parentId: string, guildId: string) => ({ id, isThread: true, parentId, guildId })
+
+describe('parseAccess — a pre-0.8.5 access.json has no `guilds` key', () => {
+  const OLD = JSON.stringify({
+    dmPolicy: 'allowlist',
+    allowFrom: [ALICE],
+    groups: { [C_LISTED]: { requireMention: false, allowFrom: [] } },
+    pending: {},
+    ackReaction: '👀',
+  })
+
+  test('parses, keeps every field it had, and gains an empty guilds map', () => {
+    const a = parseAccess(OLD)
+    expect(a.dmPolicy).toBe('allowlist')
+    expect(a.allowFrom).toEqual([ALICE])
+    expect(a.groups).toEqual({ [C_LISTED]: { requireMention: false, allowFrom: [] } })
+    expect(a.ackReaction).toBe('👀')
+    expect(a.guilds).toEqual({})
+  })
+
+  test('behaves exactly as before: its listed channel resolves, an unlisted one in the same guild does not', () => {
+    const a = parseAccess(OLD)
+    expect(resolveChannelPolicy(a, chan(C_LISTED, G1))?.source).toBe('channel')
+    expect(resolveChannelPolicy(a, chan(C_NEW, G1))).toBeUndefined()
+    expect(channelAllowed(a, chan(C_NEW, G1))).toBe(false)
+  })
+
+  test('a hand-edited `"guilds": null` does not crash resolution or the outbound check', () => {
+    const a = parseAccess(JSON.stringify({ groups: {}, guilds: null }))
+    expect(resolveChannelPolicy(a, chan(C_NEW, G1))).toBeUndefined()
+    expect(channelAllowed(a, chan(C_NEW, G1))).toBe(false)
+  })
+
+  test('a file that omits groups too still parses (defaults fill it)', () => {
+    const a = parseAccess('{}')
+    expect(a).toEqual(defaultAccess())
+    expect(defaultAccess().guilds).toEqual({})
+  })
+
+  test('the server-scope grant path works on a parsed old file (guilds ??= {} then grantGroup)', () => {
+    const a = parseAccess(OLD)
+    delete a.guilds   // worst case: the key really is absent at grant time
+    a.guilds ??= {}
+    grantGroup(a.guilds, G1, true)
+    expect(channelAllowed(a, chan(C_NEW, G1))).toBe(true)
+    expect(removeGroup(a.guilds, G1)).toBe(true)
+    expect(channelAllowed(a, chan(C_NEW, G1))).toBe(false)
+  })
+})
+
+describe('resolveChannelPolicy — channel entry, then guild fallback', () => {
+  const access = {
+    groups: { [C_LISTED]: { requireMention: false, allowFrom: [] } },
+    guilds: { [G1]: { requireMention: true, allowFrom: [ALICE] } },
+  }
+
+  test('a channel with its own entry resolves to it — and it WINS over its guild entry', () => {
+    const r = resolveChannelPolicy(access, chan(C_LISTED, G1))
+    expect(r).toEqual({ policy: { requireMention: false, allowFrom: [] }, source: 'channel', key: C_LISTED })
+  })
+
+  test('a channel with no entry in a granted guild falls back to the guild entry', () => {
+    const r = resolveChannelPolicy(access, chan(C_NEW, G1))
+    expect(r).toEqual({ policy: { requireMention: true, allowFrom: [ALICE] }, source: 'guild', key: G1 })
+  })
+
+  test('a channel in a guild nobody granted resolves to nothing', () => {
+    expect(resolveChannelPolicy(access, chan(C_OTHER, G2))).toBeUndefined()
+  })
+
+  test('no guildId (DM-shaped) never reaches the guild map', () => {
+    expect(resolveChannelPolicy(access, chan(C_NEW, null))).toBeUndefined()
+  })
+
+  test('a thread in a granted guild, under an unlisted parent, gets the guild entry', () => {
+    const r = resolveChannelPolicy(access, thread(T, C_NEW, G1))
+    expect(r?.source).toBe('guild')
+    expect(r?.key).toBe(G1)
+  })
+
+  test('a thread under a LISTED parent gets the parent entry, not the guild one', () => {
+    const r = resolveChannelPolicy(access, thread(T_UNDER_LISTED, C_LISTED, G1))
+    expect(r?.source).toBe('channel')
+    expect(r?.key).toBe(C_LISTED)
+  })
+
+  test('a thread whose parentId is unknown falls back to its own id, then the guild', () => {
+    const r = resolveChannelPolicy(access, { id: T, isThread: true, parentId: null, guildId: G1 })
+    expect(r?.source).toBe('guild')
+  })
+
+  test('the guild map is own-property only — a prototype key is not a grant', () => {
+    expect(resolveChannelPolicy({ groups: {}, guilds: {} }, chan(C_NEW, 'constructor'))).toBeUndefined()
+  })
+})
+
+describe('groupGateVerdict — the guild entry is applied exactly as a channel entry', () => {
+  test('no policy drops', () => {
+    expect(groupGateVerdict(undefined, ALICE)).toBe('drop')
+  })
+
+  test("guild allowFrom is honoured: a sender outside it is dropped, one inside it proceeds", () => {
+    const access = { groups: {}, guilds: { [G1]: { requireMention: false, allowFrom: [ALICE] } } }
+    const p = resolveChannelPolicy(access, chan(C_NEW, G1))?.policy
+    expect(groupGateVerdict(p, BOB)).toBe('drop')
+    expect(groupGateVerdict(p, ALICE)).toBe('deliver')
+  })
+
+  test('guild requireMention is honoured: true -> needs-mention, false -> deliver, absent -> needs-mention', () => {
+    const on = { groups: {}, guilds: { [G1]: { requireMention: true, allowFrom: [] } } }
+    const off = { groups: {}, guilds: { [G1]: { requireMention: false, allowFrom: [] } } }
+    const absent = { groups: {}, guilds: { [G1]: { allowFrom: [] } as unknown as { requireMention: boolean; allowFrom: string[] } } }
+    expect(groupGateVerdict(resolveChannelPolicy(on, chan(C_NEW, G1))?.policy, BOB)).toBe('needs-mention')
+    expect(groupGateVerdict(resolveChannelPolicy(off, chan(C_NEW, G1))?.policy, BOB)).toBe('deliver')
+    expect(groupGateVerdict(resolveChannelPolicy(absent, chan(C_NEW, G1))?.policy, BOB)).toBe('needs-mention')
+  })
+
+  test('a channel entry wins: the guild restricts to ALICE, the channel is open, BOB gets through only there', () => {
+    const access = {
+      groups: { [C_LISTED]: { requireMention: false, allowFrom: [] } },
+      guilds: { [G1]: { requireMention: false, allowFrom: [ALICE] } },
+    }
+    expect(groupGateVerdict(resolveChannelPolicy(access, chan(C_LISTED, G1))?.policy, BOB)).toBe('deliver')
+    expect(groupGateVerdict(resolveChannelPolicy(access, chan(C_NEW, G1))?.policy, BOB)).toBe('drop')
+  })
+
+  test('a channel entry wins the other way too: a stricter channel inside an open guild', () => {
+    const access = {
+      groups: { [C_LISTED]: { requireMention: true, allowFrom: [ALICE] } },
+      guilds: { [G1]: { requireMention: false, allowFrom: [] } },
+    }
+    expect(groupGateVerdict(resolveChannelPolicy(access, chan(C_LISTED, G1))?.policy, BOB)).toBe('drop')
+    expect(groupGateVerdict(resolveChannelPolicy(access, chan(C_NEW, G1))?.policy, BOB)).toBe('deliver')
+  })
+
+  test('a thread in a granted guild is gated by the guild entry', () => {
+    const access = { groups: {}, guilds: { [G1]: { requireMention: false, allowFrom: [ALICE] } } }
+    const p = resolveChannelPolicy(access, thread(T, C_NEW, G1))?.policy
+    expect(groupGateVerdict(p, ALICE)).toBe('deliver')
+    expect(groupGateVerdict(p, BOB)).toBe('drop')
+  })
+
+  test('the channel-only path is unchanged (regression)', () => {
+    const access = { groups: { [C_LISTED]: { requireMention: true, allowFrom: [] } } }
+    expect(groupGateVerdict(resolveChannelPolicy(access, chan(C_LISTED, G1))?.policy, BOB)).toBe('needs-mention')
+    expect(groupGateVerdict(resolveChannelPolicy(access, chan(C_NEW, G1))?.policy, BOB)).toBe('drop')
+  })
+})
+
+describe('channelAllowed — the outbound check (reply/react/edit/fetch go through it)', () => {
+  const access = {
+    groups: { [C_LISTED]: { requireMention: true, allowFrom: [] } },
+    guilds: { [G1]: { requireMention: true, allowFrom: [ALICE] } },
+  }
+
+  test('allows a channel covered only by a guild grant', () => {
+    expect(channelAllowed(access, chan(C_NEW, G1))).toBe(true)
+  })
+
+  test('allows a thread in a guild-granted server', () => {
+    expect(channelAllowed(access, thread(T, C_NEW, G1))).toBe(true)
+  })
+
+  test('a guild entry with a sender filter is still a valid TARGET — allowFrom is an inbound rule', () => {
+    expect(channelAllowed({ groups: {}, guilds: { [G1]: { requireMention: true, allowFrom: [ALICE] } } }, chan(C_NEW, G1))).toBe(true)
+  })
+
+  test('still allows a listed channel and refuses one in an ungranted guild', () => {
+    expect(channelAllowed(access, chan(C_LISTED, G1))).toBe(true)
+    expect(channelAllowed(access, chan(C_OTHER, G2))).toBe(false)
+    expect(channelAllowed(access, thread(T, C_OTHER, G2))).toBe(false)
+  })
+
+  test('inbound and outbound agree on every case above (one rule, not two)', () => {
+    for (const ch of [chan(C_LISTED, G1), chan(C_NEW, G1), chan(C_OTHER, G2), thread(T, C_NEW, G1), thread(T, C_OTHER, G2), chan(C_NEW, null)]) {
+      expect(channelAllowed(access, ch)).toBe(resolveChannelPolicy(access, ch) !== undefined)
+    }
+  })
+})
+
 describe('grantDm / removeDm', () => {
   test('grant adds the user to allowFrom', () => {
     const allow: string[] = []
