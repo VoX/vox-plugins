@@ -28,7 +28,15 @@
       { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh '🐾 working…'" } ] }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh --idle" } ] }
+      { "hooks": [
+        { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}\"/presence/usage_state.py --success" },
+        { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}\"/presence/presence-status.sh --idle" }
+      ] }
+    ],
+    "StopFailure": [
+      { "matcher": "rate_limit", "hooks": [
+        { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}\"/presence/usage_state.py --failure" }
+      ] }
     ]
   }
 }

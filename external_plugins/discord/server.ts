@@ -43,6 +43,7 @@ import { homedir } from 'os'
 import { join, sep, dirname } from 'path'
 import sharp from 'sharp'
 import { snapshotGuild, applyServerSpecChecked } from './apply'
+import { USAGE_LIMIT_FILE, MAX_USAGE_STATE_BYTES, parseUsageLimitState, usageAlarmText } from './usage-presence'
 import { planRolePositions, isAdminTool } from './lib'
 import { runAdminTool, ADMIN_TOOL_DEFS, type AdminDeps } from './admin'
 import { normalizeLookupQuery, clampLookupLimit, lookupNameMatches, lookupRank, safeSlice, formatSendResult, chunk, buildEmbedFromArgs, EMBED_SCHEMA_PROPS, PRESENCE_IDLE, isIdle, composePresence, withContextPrefix, buildServerSpec, computeSpecDiff, renderSpecDiff, grantGroup, removeGroup, resolveChannelPolicy, channelAllowed, channelRefOf, channelGrantKey, groupGateVerdict, parseAccess, serializeAccess, defaultAccess, resolvePermissionReply, type Access, grantDm, removeDm, resolveById, makeTtlCache, DANGEROUS_PERMS, countDeletions, type ServerSpec } from './lib'
@@ -883,6 +884,15 @@ let firstPendingAt = 0                   // epoch ms the current un-published ba
 // An explicit status file pins the custom status (e.g. auto-DND at high usage). Outranked by the
 // auth alarm below, since that one means the bot cannot work at all rather than merely being busy.
 const PRESENCE_STATUS_FILE = join(STATE_DIR, '.presence-status')
+// Written by StopFailure(rate_limit), cleared ONLY by a successful main Stop.
+// Separate from manual pins so a normal tool/start hook cannot hide exhaustion.
+const PRESENCE_USAGE_LIMIT_FILE = join(STATE_DIR, USAGE_LIMIT_FILE)
+function readUsageLimitState() {
+  try {
+    if (statSync(PRESENCE_USAGE_LIMIT_FILE).size > MAX_USAGE_STATE_BYTES) return null
+    return parseUsageLimitState(readFileSync(PRESENCE_USAGE_LIMIT_FILE, 'utf8'))
+  } catch { return null }
+}
 // Set by the auth watcher (startAuthWatch, further down). Declared beside the other presence state
 // because tickPresence is its only reader. The hooks that drive the normal status stop firing when
 // Claude is logged out, so without this the last thing they wrote sits there looking healthy.
@@ -907,6 +917,9 @@ function setPresenceNow(text: string, alarm = false): boolean {
   // prefix: it is written by the plugin, not by the hooks, and the hooks' last context reading is
   // stale by definition in the state the alarm reports.
   text = alarm ? sanitizeStatus(text) : sanitizeStatus(withContextPrefix(readContextPrefix(), text))
+  // Do this BEFORE text deduplication: inbound messages can re-arm typing while
+  // an unchanged quota/auth alarm is held. No new gateway write is needed.
+  if (PRESENCE_TYPING && alarm) stopAllTyping()
   if (text === lastPresenceText) return false  // dedupe: no wire write
   lastPresenceText = text
   const resting = isResting(text)
@@ -943,6 +956,12 @@ function tickPresence(): void {
   // otherwise overwrite it on the next hook write; setPresenceNow dedupes on text, so holding it
   // costs zero wire writes and cannot consume the 5-per-20s budget.
   if (authDead) { setPresenceNow(AUTH_DEAD_STATUS, true); return }
+
+  // Native failure hooks continue to run when no model turn can succeed. Hold
+  // quota alarms above both manual status and normal activity, and retain them
+  // across bridge/service restarts until a successful main-session Stop.
+  const usageLimit = readUsageLimitState()
+  if (usageLimit) { setPresenceNow(usageAlarmText(usageLimit), true); return }
 
   // An explicit pin (auto-DND at high usage, etc). Below the auth alarm, above the hook activity.
   let pinned = ''
@@ -992,7 +1011,12 @@ function tickPresence(): void {
 
 function startPresenceWatcher(): void {
   if (!PRESENCE_ACTIVITY && !PRESENCE_TYPING) return
-  setPresenceNow('')  // clear any stale status from a mid-turn restart
+  // Do not briefly publish "recovered/idle" merely because the bridge restarted.
+  // A durable quota alarm must be the FIRST presence packet after READY.
+  const usageLimit = readUsageLimitState()
+  if (authDead) setPresenceNow(AUTH_DEAD_STATUS, true)
+  else if (usageLimit) setPresenceNow(usageAlarmText(usageLimit), true)
+  else setPresenceNow('')  // clear stale ordinary activity from a mid-turn restart
   // Baseline any pre-restart sequence file as already-shown. Without this, lastRawSeen='' makes
   // raw.startsWith(lastRawSeen) always true, so the stale file never reads as "replaced" and its
   // whole action trail publishes as an unshown tail ~1s after startup — the status would replay a
