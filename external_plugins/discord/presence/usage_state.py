@@ -232,6 +232,51 @@ def read_event(stream):
         return None
 
 
+# Official Z.ai business codes, not HTTP status codes. Unknown structured
+# codes do not establish exhaustion; unstructured native rate_limit events
+# retain the generic (e.g. Anthropic) behavior.
+_ZAI_USAGE_CODES = frozenset({1113, 1308, 1309, 1310, 1314, *range(1316, 1322)})
+_API_ERROR_PREFIX = re.compile(r"^API\s*Error:\s*[1-5][0-9]{2}\s+")
+_ZAI_FLATTENED = re.compile(
+    r"^API\s*Error:\s*[^\r\n()\[\]]{1,128}\(429\)\s*·\s*"
+    r"\[([1-9][0-9]{3})\]\[[^\]\r\n]{0,32768}\](?:\[[^\]\r\n]{0,1024}\])?\s*$"
+)
+
+
+def parse_zai_code(event):
+    """Read only error_details' exact error.code envelope, never message text.
+
+    Accept a JSON object or its JSON serialization, optionally preceded by the
+    native 'APIError: 429 ' wrapper. No scanning for numbers or JSON fragments.
+    A code alone does not authenticate a provider; only the documented usage
+    allowlist is used to interpret structured business errors.
+    """
+    details = event.get("error_details")
+    if isinstance(details, str):
+        if len(details) > MAX_INPUT:
+            return None
+        # Claude's Z.ai compatibility transport flattens the provider envelope:
+        # API Error: ... (429) · [1310][provider message][provider tag]
+        # This is an anchored native wrapper, never a number search in prose.
+        flattened = _ZAI_FLATTENED.fullmatch(details.strip())
+        if flattened:
+            return int(flattened.group(1))
+        details = _API_ERROR_PREFIX.sub("", details.strip(), count=1)
+        try:
+            details = json.loads(details, object_pairs_hook=_unique_object,
+                                 parse_constant=_invalid_constant)
+        except (ValueError, TypeError, RecursionError):
+            return None
+    if not isinstance(details, dict) or not isinstance(details.get("error"), dict):
+        return None
+    code = details["error"].get("code")
+    if type(code) is int and 1000 <= code <= 9999:
+        return code
+    if isinstance(code, str) and re.fullmatch(r"[1-9][0-9]{3}", code):
+        return int(code)
+    return None
+
+
 def _write_marker(state_dir, state):
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     # mkstemp is exclusive and mode 0600. Replace never follows a marker symlink.
@@ -263,6 +308,9 @@ def handle_event(mode, event, state_dir, *, proc_root=Path("/proc"),
         return False
     if mode == "--failure":
         if event.get("hook_event_name") != "StopFailure" or event.get("error") != "rate_limit":
+            return False
+        code = parse_zai_code(event)
+        if code is not None and code not in _ZAI_USAGE_CODES:
             return False
     elif mode == "--success":
         if event.get("hook_event_name") != "Stop" or event.get("error") not in (None, ""):

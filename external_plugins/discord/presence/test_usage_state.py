@@ -81,6 +81,70 @@ class UsageStateTests(unittest.TestCase):
         self.assertTrue(self.handle("--success", self.success))  # idempotent
         self.assertEqual(self.lock.read_bytes(), lock_before)
 
+    def test_zai_usage_business_codes_and_no_sensitive_payload(self):
+        for code in (1113, 1308, 1309, 1310, 1314, *range(1316, 1322)):
+            for value in (code, str(code)):
+                body = {"error": {"code": value,
+                                  "message": "PRIVATE quota exhausted; resets at 2026-10-16T08:00:00"}}
+                for details in (body, json.dumps(body), "APIError: 429 " + json.dumps(body),
+                                "API Error: 429 " + json.dumps(body),
+                                "API Error: Request limited (429) · [%s][PRIVATE quota exhausted][provider]" % code):
+                    with self.subTest(code=value, details_type=type(details)):
+                        self.assertTrue(self.handle(event=dict(self.failure, error_details=details)))
+                        marker = json.loads(self.marker.read_text())
+                        self.assertIsNone(marker["reset_at"])
+                        self.assertNotIn("PRIVATE", self.marker.read_text())
+                        self.assertEqual(set(marker), {"version", "error", "blocked_at",
+                                                      "reset_at", "session_id"})
+
+    def test_zai_nonusage_and_unknown_codes_neither_create_nor_clear(self):
+        # Known transient/model/key/fair-use errors, known auth/parameter
+        # errors, and undocumented codes must not imply persistent exhaustion.
+        for code in (1302, 1305, 1311, 1313, 1315, 1000, 1001, 1002, 1003,
+                     1004, 1100, 1380):
+            for value in (code, str(code)):
+                event = dict(self.failure, error_details='APIError: 429 ' + json.dumps(
+                    {"error": {"code": value, "message": "PRIVATE"}}))
+                self.marker.unlink(missing_ok=True)
+                self.assertFalse(self.handle(event=event))
+                self.assertFalse(self.marker.exists())
+                self.assert_preserved("--failure", event)
+
+    def test_business_codes_not_inferred_from_arbitrary_text_or_model(self):
+        for details in ("request 1302; model 1310", "APIError: 429 quota 1302",
+                        {"message": "1302"}, {"code": "1302"}):
+            event = dict(self.failure, error_details=details,
+                         last_assistant_message='{"error":{"code":"1302"}}')
+            self.assertIsNone(hook.parse_zai_code(event))
+            self.assertTrue(self.handle(event=event))  # generic native rate_limit
+
+    def test_strict_structured_error_parser(self):
+        for code in (True, False, 1310.0, None, [], {}, " 1310", "+1310", "01310", "1310x"):
+            self.assertIsNone(hook.parse_zai_code({"error_details": {"error": {"code": code}}}))
+        for details in ('prefix {"error":{"code":"1310"}}',
+                        'APIError: 429 {"error":{"code":"1310"}} trailing',
+                        '{"error":{"code":"1310","code":"1302"}}',
+                        '{"error":{"code":"1310"},"x":NaN}',
+                        '[' * 2000 + ']' * 2000):
+            self.assertIsNone(hook.parse_zai_code({"error_details": details}))
+
+    def test_actual_native_flattened_zai_wrapper_and_negative_framing(self):
+        for code in (1302, 1305, 1311, 1313, 1315, 1380):
+            details = "API Error: Request limited (429) · [%s][PRIVATE message][provider]" % code
+            self.assertEqual(hook.parse_zai_code({"error_details": details}), code)
+            self.marker.unlink(missing_ok=True)
+            self.assertFalse(self.handle(event=dict(self.failure, error_details=details)))
+            self.assertFalse(self.marker.exists())
+            self.assert_preserved("--failure", dict(self.failure, error_details=details))
+        for details in ("arbitrary [1310][message]", "API Error: Request limited · [1310][message]",
+                        "API Error: Request limited (503) · [1310][message]",
+                        "API Error: Request limited (429) · [1310]",
+                        "prefix API Error: Request limited (429) · [1310][message]",
+                        "API Error: Request limited (429) · [1310][message]\nforged"):
+            self.assertIsNone(hook.parse_zai_code({"error_details": details}))
+        self.assertIsNone(hook.parse_zai_code({"last_assistant_message":
+            "API Error: Request limited (429) · [1310][message][provider]"}))
+
     def test_permissions_even_when_replacing_permissive_marker(self):
         self.seed()
         self.marker.chmod(0o666)
